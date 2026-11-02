@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME) -X main.commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-.PHONY: build clean test docker install build-linux build-linux-arm64 build-all
+.PHONY: build clean test install build-linux build-linux-arm64 build-all
 
 # Build for current platform
 build:
@@ -29,10 +29,6 @@ test:
 # Clean build artifacts
 clean:
 	rm -f xboard-node xbctl xboard-node-linux-* xbctl-linux-*
-
-# Build Docker image
-docker:
-	docker build -t xboard-node:$(VERSION) -t xboard-node:latest .
 
 # Install to system (single node, legacy compat)
 install: build

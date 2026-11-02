@@ -14,23 +14,6 @@
 
 ## 安装
 
-### Docker
-
-```bash
-docker run -d --restart=always --network=host \
-  -e apiHost=https://panel.com -e apiKey=TOKEN -e nodeID=1 \
-  ghcr.io/zzx327317-creator/xboard-node:latest
-```
-
-### Docker Compose
-
-```bash
-git clone -b compose --depth 1 https://github.com/zzx327317-creator/Xboard-Node.git
-cd Xboard-Node
-vim config/config.yml   # 设置 panel.url / token / node_id
-docker compose up -d
-```
-
 ### 安装脚本（Linux + systemd）
 
 仅支持主流系统：Ubuntu、Debian、CentOS、RHEL、Rocky、AlmaLinux、Fedora，amd64 / arm64 架构，且必须使用 systemd。
