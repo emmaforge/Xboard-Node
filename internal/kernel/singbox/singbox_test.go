@@ -11,6 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/sagernet/sing-box/adapter"
 	singM "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 )
 
@@ -211,5 +212,55 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 	cancelWrite()
 	if n, err := writeTracked.Write([]byte("a")); !errors.Is(err, context.Canceled) || n != 0 {
 		t.Fatalf("second Write() = (%d, %v), want (0, context canceled)", n, err)
+	}
+}
+
+func TestConnTrackerCloseByUUIDClosesOnlyThatUser(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+	base1 := &testConn{}
+	base2 := &testConn{}
+	wrapped1 := tracker.RoutedConnection(context.Background(), base1, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	tracker.RoutedConnection(context.Background(), base2, testInboundContext("uuid-2", "2.2.2.2"), nil, nil)
+	if wrapped1 == base1 {
+		t.Fatal("expected first connection to be wrapped")
+	}
+
+	if n := tracker.CloseByUUID("uuid-1"); n != 1 {
+		t.Fatalf("CloseByUUID(uuid-1) = %d, want 1", n)
+	}
+	if !base1.closed {
+		t.Fatal("expected uuid-1 connection to be closed")
+	}
+	if base2.closed {
+		t.Fatal("expected uuid-2 connection to stay open")
+	}
+	if n := tracker.CloseByUUID("uuid-1"); n != 0 {
+		t.Fatalf("second CloseByUUID(uuid-1) = %d, want 0", n)
+	}
+}
+
+// testPacketConn is a minimal N.PacketConn for registration tests: it embeds
+// the interface so only Close needs a real implementation.
+type testPacketConn struct {
+	N.PacketConn
+	closed bool
+}
+
+func (c *testPacketConn) Close() error { c.closed = true; return nil }
+
+func TestConnTrackerCloseByUUIDClosesUDPPacketConns(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	base := &testPacketConn{}
+	wrapped := tracker.RoutedPacketConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	if wrapped == nil {
+		t.Fatal("expected a wrapped packet connection")
+	}
+	if n := tracker.CloseByUUID("uuid-1"); n != 1 {
+		t.Fatalf("CloseByUUID(uuid-1) = %d, want 1", n)
+	}
+	if !base.closed {
+		t.Fatal("expected UDP packet connection to be closed")
 	}
 }

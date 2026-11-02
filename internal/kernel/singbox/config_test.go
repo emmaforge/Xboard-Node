@@ -738,8 +738,40 @@ func TestBuildRoutes_StructuredCustomRulesRemainFirst(t *testing.T) {
 	if allRules[0]["outbound"] != "direct" {
 		t.Fatalf("expected structured route first, got %v", allRules[0]["outbound"])
 	}
-	if allRules[1]["outbound"] != "raw-tag" {
-		t.Fatalf("expected raw custom route second, got %v", allRules[1]["outbound"])
+	// B16: raw custom rules must rank AFTER the private-IP blocks, so
+	// a raw rule can no longer bypass the SSRF block. Order is now:
+	// structured (0), private blocks (1,2), raw (3).
+	if allRules[1]["outbound"] != "block" || allRules[2]["outbound"] != "block" {
+		t.Fatalf("expected private-IP blocks at 1,2, got %v / %v", allRules[1]["outbound"], allRules[2]["outbound"])
+	}
+	if allRules[3]["outbound"] != "raw-tag" {
+		t.Fatalf("expected raw custom route after private blocks, got %v", allRules[3]["outbound"])
+	}
+}
+
+func TestInsertAfterPrivateBlocks(t *testing.T) {
+	existing := []M{
+		{"domain_suffix": []string{"panel.example"}, "outbound": "direct"},
+		{"ip_cidr": []string{"10.0.0.0/8", "192.168.0.0/16"}, "outbound": "block"},
+		{"ip_cidr": []string{"fc00::/7"}, "outbound": "block"},
+		{"domain_suffix": []string{"after.example"}, "outbound": "direct"},
+	}
+	got := insertAfterPrivateBlocks(existing, []any{
+		map[string]any{"domain": []string{"custom.example"}, "outbound": "custom-tag"},
+	})
+	if len(got) != 5 {
+		t.Fatalf("rules count: got %d, want 5", len(got))
+	}
+	if got[3]["outbound"] != "custom-tag" {
+		t.Fatalf("custom rule should sit right after the private blocks, got order %v", []any{got[0]["outbound"], got[1]["outbound"], got[2]["outbound"], got[3]["outbound"], got[4]["outbound"]})
+	}
+	// No private blocks present: falls back to prepend.
+	plain := []M{{"domain_suffix": []string{"a.example"}, "outbound": "direct"}}
+	got = insertAfterPrivateBlocks(plain, []any{
+		map[string]any{"domain": []string{"c.example"}, "outbound": "custom-tag"},
+	})
+	if got[0]["outbound"] != "custom-tag" {
+		t.Fatalf("without private blocks custom rules should prepend, got %v", got[0]["outbound"])
 	}
 }
 
@@ -885,5 +917,34 @@ func TestExtractECHInbound(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCompilePanelRouteRule_GeoIPAndGeoSite(t *testing.T) {
+	rules := []panel.RouteRule{
+		{ID: 1, Match: []string{"geoip:private", "geosite:cn", "geoip:cn"}, Action: "block"},
+	}
+	route := buildRoutes(testRouteRules(rules), nil, nil)
+	allRules := route["rules"].([]M)
+	// 2 default private-IP rules + 1 geoip rule + 1 geosite rule.
+	if len(allRules) != 4 {
+		t.Fatalf("rules count: got %d, want 4", len(allRules))
+	}
+	geoips, ok := allRules[2]["geoip"].([]string)
+	if !ok || len(geoips) != 2 || geoips[0] != "private" || geoips[1] != "cn" {
+		t.Errorf("geoip rule: got %v, want [private cn]", allRules[2]["geoip"])
+	}
+	geosites, ok := allRules[3]["geosite"].([]string)
+	if !ok || len(geosites) != 1 || geosites[0] != "cn" {
+		t.Errorf("geosite rule: got %v, want [cn]", allRules[3]["geosite"])
+	}
+	for _, r := range allRules {
+		if ds, ok := r["domain_suffix"].([]string); ok {
+			for _, d := range ds {
+				if d == "geoip:private" || d == "geosite:cn" {
+					t.Errorf("geo entry leaked into domain_suffix: %v", ds)
+				}
+			}
+		}
 	}
 }
