@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cedar2025/xboard-node/internal/config"
 )
 
 func runMenuWithInput(t *testing.T, input string) string {
@@ -199,6 +201,74 @@ func TestColorizeStatusValue(t *testing.T) {
 	}
 }
 
+func TestLoadCredentialsEnvFrom(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credentials.env")
+	content := "# comment\n\nTEST_XBNODE_TOKEN_A=secret-a\nBADLINE\nTEST_XBNODE_TOKEN_B=secret=b\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_XBNODE_TOKEN_A", "keep-me")
+	oldB, hadB := os.LookupEnv("TEST_XBNODE_TOKEN_B")
+	os.Unsetenv("TEST_XBNODE_TOKEN_B")
+	defer func() {
+		if hadB {
+			os.Setenv("TEST_XBNODE_TOKEN_B", oldB)
+		} else {
+			os.Unsetenv("TEST_XBNODE_TOKEN_B")
+		}
+	}()
+	loadCredentialsEnvFrom(path)
+	if got := os.Getenv("TEST_XBNODE_TOKEN_A"); got != "keep-me" {
+		t.Errorf("existing env should win, got %q", got)
+	}
+	if got := os.Getenv("TEST_XBNODE_TOKEN_B"); got != "secret=b" {
+		t.Errorf("missing key should be filled from file, got %q", got)
+	}
+	// Missing file is a silent no-op, not an error.
+	loadCredentialsEnvFrom(filepath.Join(dir, "nope.env"))
+}
+
+// 复现用户服务器上的情况：机器模式配置里 token 为空、只有 token_env，
+// 真 token 在 credentials.env 里。不读凭据文件时 LoadRoot 校验失败，
+// 读了之后才通过——这正是底部误报未启动而服务本身正常的原因。
+func TestMachineConfigTokenFromCredentialsEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yml")
+	cfg := "panel:\n  url: https://panel.example.org\nmachine:\n  machine_id: 1\n  token_env: TEST_XBNODE_MACHINE_TOKEN\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(dir, "credentials.env")
+	if err := os.WriteFile(credPath, []byte("TEST_XBNODE_MACHINE_TOKEN=secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old, had := os.LookupEnv("TEST_XBNODE_MACHINE_TOKEN")
+	os.Unsetenv("TEST_XBNODE_MACHINE_TOKEN")
+	defer func() {
+		if had {
+			os.Setenv("TEST_XBNODE_MACHINE_TOKEN", old)
+		} else {
+			os.Unsetenv("TEST_XBNODE_MACHINE_TOKEN")
+		}
+	}()
+	if _, err := config.LoadRoot(cfgPath); err == nil {
+		t.Fatalf("LoadRoot without credentials env should fail, got success")
+	}
+	loadCredentialsEnvFrom(credPath)
+	root, err := config.LoadRoot(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadRoot with credentials env: %v", err)
+	}
+	instances, err := root.NormalizeInstances()
+	if err != nil || len(instances) != 1 {
+		t.Fatalf("NormalizeInstances = %d instances, err %v", len(instances), err)
+	}
+	if instances[0].Machine == nil || instances[0].Machine.Token != "secret-token" {
+		t.Errorf("machine token was not resolved from credentials env")
+	}
+}
+
 func TestFooterStatusText(t *testing.T) {
 	cases := []struct {
 		valid bool
@@ -223,17 +293,17 @@ func TestFooterStatusText(t *testing.T) {
 	}
 }
 
-// 提示范围与菜单项数量挂钩：加了 13/14 后提示必须是 [0-14]。
+// 提示范围与菜单项数量挂钩：加了 13/14/15 后提示必须是 [0-15]。
 func TestMenuPromptRange(t *testing.T) {
 	in := bufio.NewReader(strings.NewReader("0\n"))
 	var out bytes.Buffer
 	if err := runMenuLoop(in, &out); err != nil {
 		t.Fatalf("runMenuLoop: %v", err)
 	}
-	if !strings.Contains(out.String(), "请输入选项编号 [0-14]：") {
-		t.Errorf("prompt range not updated to [0-14]:\n%s", out.String())
+	if !strings.Contains(out.String(), "请输入选项编号 [0-15]：") {
+		t.Errorf("prompt range not updated to [0-15]:\n%s", out.String())
 	}
-	for _, want := range []string{"13. 开启开机自启", "14. 关闭开机自启"} {
+	for _, want := range []string{"13. 开启开机自启", "14. 关闭开机自启", "15. 删除实例"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("menu output missing %q:\n%s", want, out.String())
 		}
@@ -269,8 +339,8 @@ func testDisplayWidth(s string) int {
 func TestPrintMenuAlignment(t *testing.T) {
 	var out bytes.Buffer
 	printMenu(&out)
-	titles := []string{"安装/绑定节点", "绑定机器", "启动服务", "停止服务", "重启服务", "查看服务状态", "查看实例列表", "查看实时日志", "查看版本", "切换内核", "更新到最新版", "卸载", "开启开机自启", "关闭开机自启"}
-	descs := []string{"填写面板地址、节点密钥", "填写面板地址、机器密钥", "启动 xboard-node", "停止 xboard-node", "重启 xboard-node", "服务、健康检查", "列出已绑定的节点", "跟随输出服务日志", "显示 xbnode 版本", "在 sing-box 与 xray 之间切换", "从发布页下载最新版", "停止并删除服务", "设置 xboard-node 开机自启", "取消 xboard-node 开机自启"}
+	titles := []string{"安装/绑定节点", "绑定机器", "启动服务", "停止服务", "重启服务", "查看服务状态", "查看实例列表", "查看实时日志", "查看版本", "切换内核", "更新到最新版", "卸载", "开启开机自启", "关闭开机自启", "删除实例"}
+	descs := []string{"填写面板地址、节点密钥", "填写面板地址、机器密钥", "启动 xboard-node", "停止 xboard-node", "重启 xboard-node", "服务、健康检查", "列出已绑定的节点", "跟随输出服务日志", "显示 xbnode 版本", "在 sing-box 与 xray 之间切换", "从发布页下载最新版", "停止并删除服务", "设置 xboard-node 开机自启", "取消 xboard-node 开机自启", "删除一个已绑定的节点/机器实例"}
 	var titleCol, descCol = -1, -1
 	for _, line := range strings.Split(out.String(), "\n") {
 		for i, title := range titles {

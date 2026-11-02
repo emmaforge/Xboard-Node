@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -91,6 +92,7 @@ func printMenu(out io.Writer) {
 		{12, "卸载", "停止并删除服务与二进制，可选清除配置（需确认）"},
 		{13, "开启开机自启", "设置 xboard-node 开机自启"},
 		{14, "关闭开机自启", "取消 xboard-node 开机自启"},
+		{15, "删除实例", "删除一个已绑定的节点/机器实例"},
 		{0, "退出菜单", ""},
 	}
 	for _, it := range menuItems {
@@ -105,7 +107,7 @@ func printMenu(out io.Writer) {
 	color := menuOutputIsTerminal(out)
 	fmt.Fprintf(out, "xboard-node 状态：%s\n", colorizeStatusValue(status, color))
 	fmt.Fprintf(out, "是否开机自启：%s\n", colorizeAutostartValue(autostart, color))
-	fmt.Fprint(out, "请输入选项编号 [0-14]：")
+	fmt.Fprint(out, "请输入选项编号 [0-15]：")
 }
 
 // displayWidth 返回字符串在终端里占的列数：中文及全角字符算 2 列，
@@ -207,6 +209,10 @@ func colorizeAutostartValue(autostart string, color bool) string {
 // 注意不走 install-meta.json 的兜底：配置本身坏了、服务起不来时，
 // 底部就不该因为一份陈旧的绑定记录而显示运行中。
 func footerHasValidDeployment() bool {
+	// The service reads its token from credentials.env via the unit's
+	// EnvironmentFile; the menu must source the same file or a bound
+	// machine looks unconfigured here (see loadCredentialsEnv).
+	loadCredentialsEnv()
 	root, err := config.LoadRoot(defaultConfigPath)
 	if err != nil {
 		return false
@@ -350,8 +356,12 @@ func runMenuLoop(in *bufio.Reader, out io.Writer) error {
 			} else {
 				fmt.Fprintln(out, "已关闭开机自启。")
 			}
+		case "15":
+			if err := menuRemoveInstance(in, out); err != nil {
+				fmt.Fprintf(out, "操作失败：%v\n", err)
+			}
 		default:
-			fmt.Fprintln(out, "无效的选择，请输入 0-14 的编号。")
+			fmt.Fprintln(out, "无效的选择，请输入 0-15 的编号。")
 			continue
 		}
 		if err := pauseForMenu(in, out); err != nil {
@@ -653,6 +663,59 @@ func menuSwitchKernel(in *bufio.Reader, out io.Writer) error {
 
 // menuUninstall：卸载，复用 runUninstall；是否清除配置先问清楚，
 // 再做一次最终确认，之后 runUninstall 以 --yes 跳过它自己的提问。
+// menuRemoveInstance 列出已绑定的实例，让用户按编号选一个删除，
+// 删除前二次确认。复用 removeBinding：删完最后一个实例后服务会
+// 自动停止，底部状态在下次渲染时刷新。
+func menuRemoveInstance(in *bufio.Reader, out io.Writer) error {
+	rows, err := collectInstanceRows()
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "当前没有已绑定的实例。")
+		return nil
+	}
+	fmt.Fprintln(out, "已绑定的实例：")
+	for i, r := range rows {
+		modeName := "节点"
+		if r.Mode == "machine" {
+			modeName = "机器"
+		}
+		fmt.Fprintf(out, "  %d. %s（%s，面板 %s，%s）\n", i+1, r.ID, modeName, r.Panel, r.Target)
+	}
+	fmt.Fprint(out, "请输入要删除的实例编号（直接回车取消）：")
+	input, err := readLine(in)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			fmt.Fprintln(out, "已取消。")
+			return nil
+		}
+		return err
+	}
+	if input == "" {
+		fmt.Fprintln(out, "已取消。")
+		return nil
+	}
+	n, err := strconv.Atoi(input)
+	if err != nil || n < 1 || n > len(rows) {
+		return fmt.Errorf("无效的实例编号 %q", input)
+	}
+	row := rows[n-1]
+	ok, err := confirm(in, out, fmt.Sprintf("确认删除实例 %s 吗？删除后该实例不再同步", row.ID))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fmt.Fprintln(out, "已取消。")
+		return nil
+	}
+	if err := removeBinding("", 0, 0, row.ID); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "实例已删除。")
+	return nil
+}
+
 func menuUninstall(in *bufio.Reader, out io.Writer) error {
 	purge, err := confirm(in, out, "是否同时清除配置文件和数据（/etc/xboard-node）？选否仅删除服务与二进制，配置会保留")
 	if err != nil {

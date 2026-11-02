@@ -1282,7 +1282,41 @@ func collectRowsFromMeta() ([]instanceRow, error) {
 	return rows, nil
 }
 
+// loadCredentialsEnv mirrors the service unit's EnvironmentFile
+// (credentials.env): binding stores the panel/machine token only as
+// token_env in config.yml and the real token in this file, so a CLI
+// process that never sources it fails LoadRoot validation with
+// "token is required" even while the service runs fine. Only keys not
+// already present in the environment are set, so an explicit shell
+// export still wins. A missing or unreadable file is a silent no-op;
+// the file's contents are never printed.
+func loadCredentialsEnv() {
+	loadCredentialsEnvFrom(defaultCredentialsPath)
+}
+
+func loadCredentialsEnvFrom(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+			continue
+		}
+		k, v, _ := strings.Cut(line, "=")
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(k); !exists {
+			os.Setenv(k, v)
+		}
+	}
+}
+
 func collectRowsFromConfig() ([]instanceRow, error) {
+	loadCredentialsEnv()
 	root, err := config.LoadRoot(defaultConfigPath)
 	if err != nil {
 		return nil, err
@@ -1353,6 +1387,7 @@ func instanceAwareHealth() string {
 	// cmd/xboard-node: only instances[0].HealthPort is ever served),
 	// so a stale meta port must not shadow it.
 	port := 0
+	loadCredentialsEnv()
 	if root, err := config.LoadRoot(defaultConfigPath); err == nil {
 		if instances, normErr := root.NormalizeInstances(); normErr == nil && len(instances) > 0 {
 			port = instances[0].HealthPort
