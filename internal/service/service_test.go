@@ -337,6 +337,33 @@ func TestApplyUserDeltaRemoveClosesRemovedUsersConnections(t *testing.T) {
 	}
 }
 
+// Regression: panel delta-remove payloads carry only the user ID
+// (CheckTrafficExceeded / notifyUserChanged send [{'id': id}]), so the
+// backend must resolve the UUID from its pre-delta user set. Closing by
+// the empty UUID is a silent no-op in both kernels and also leaves no
+// tombstone for the trackAndEnforce safety net, which is exactly how an
+// out-of-quota user's existing connection survived indefinitely while
+// reconnects were already blocked.
+func TestApplyUserDeltaRemoveWithIDOnlyClosesConnections(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	oldUsers := []model.UserSpec{{ID: 1, UUID: "uuid-old", SpeedLimit: 4}, {ID: 2, UUID: "uuid-kept", SpeedLimit: 4}}
+	s.updateUserState(oldUsers)
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+
+	if k.closeCalls != 1 || len(k.closedUUIDs) != 1 || k.closedUUIDs[0] != "uuid-old" {
+		t.Fatalf("CloseUserConnections calls = %v, want [uuid-old]", k.closedUUIDs)
+	}
+	if got := s.removedUserUUIDs[1]; got != "uuid-old" {
+		t.Fatalf("removedUserUUIDs[1] = %q, want uuid-old (safety-net tombstone)", got)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 {
+		t.Fatalf("lastUsers = %#v, want only user 2", s.lastUsers)
+	}
+}
+
 func TestTrackAndEnforceClosesStrayRemovedUserConnections(t *testing.T) {
 	k := &fakeKernel{
 		running:      true,

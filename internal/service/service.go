@@ -893,7 +893,27 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		// RemoveUsers only blocks new connections; kill the removed
 		// users' existing connections, in both the direct and fallback
 		// paths (filtered is the authoritative new set in both).
-		s.closeRemovedUsers(ctx, deltaUsers)
+		// Panel delta payloads carry only the user ID (see
+		// CheckTrafficExceeded / notifyUserChanged: users are
+		// [{'id': id}]), so deltaUsers usually has an empty UUID.
+		// Closing by that empty UUID would be a silent no-op in both
+		// kernels, and the trackAndEnforce safety net would also skip
+		// the user because no tombstone was recorded. Resolve the
+		// UUIDs from the pre-delta user set (prevUsers) first.
+		removedWithUUID := make([]model.UserSpec, 0, len(deltaUsers))
+		for _, d := range deltaUsers {
+			u := d
+			if u.UUID == "" {
+				for _, old := range prevUsers {
+					if old.ID == d.ID {
+						u.UUID = old.UUID
+						break
+					}
+				}
+			}
+			removedWithUUID = append(removedWithUUID, u)
+		}
+		s.closeRemovedUsers(ctx, removedWithUUID)
 		if s.nodeLog != nil && removed > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
 		}
