@@ -23,6 +23,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/cedar2025/xboard-node/internal/config"
 )
 
 // menuRestartService 是切换内核后重启服务的操作，抽成变量只为让
@@ -87,6 +89,8 @@ func printMenu(out io.Writer) {
 		{10, "切换内核", "在 sing-box 与 xray 之间切换（需确认并重启）"},
 		{11, "更新到最新版", "从发布页下载最新版并替换二进制（需确认）"},
 		{12, "卸载", "停止并删除服务与二进制，可选清除配置（需确认）"},
+		{13, "开启开机自启", "设置 xboard-node 开机自启"},
+		{14, "关闭开机自启", "取消 xboard-node 开机自启"},
 		{0, "退出菜单", ""},
 	}
 	for _, it := range menuItems {
@@ -101,7 +105,7 @@ func printMenu(out io.Writer) {
 	color := menuOutputIsTerminal(out)
 	fmt.Fprintf(out, "xboard-node 状态：%s\n", colorizeStatusValue(status, color))
 	fmt.Fprintf(out, "是否开机自启：%s\n", colorizeAutostartValue(autostart, color))
-	fmt.Fprint(out, "请输入选项编号 [0-12]：")
+	fmt.Fprint(out, "请输入选项编号 [0-14]：")
 }
 
 // displayWidth 返回字符串在终端里占的列数：中文及全角字符算 2 列，
@@ -167,19 +171,18 @@ func menuOutputIsTerminal(out io.Writer) bool {
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-// colorizeStatusValue 给运行状态值上色：开（已运行）绿，关（未运行、
-// 异常）红，启动/停止中黄，未知不着色。color 为 false 时原样返回。
+// colorizeStatusValue 给运行状态值上色：开绿关红——运行中（含已运行、
+// 启动中）绿，停止（含未运行、停止中、异常）红，未知不着色。
+// color 为 false 时原样返回。
 func colorizeStatusValue(status string, color bool) string {
 	if !color {
 		return status
 	}
 	switch status {
-	case "已运行":
+	case "已运行", "运行中", "启动中":
 		return "\x1b[32m" + status + "\x1b[0m"
-	case "未运行", "异常":
+	case "未运行", "未启动", "停止", "停止中", "异常":
 		return "\x1b[31m" + status + "\x1b[0m"
-	case "启动中", "停止中":
-		return "\x1b[33m" + status + "\x1b[0m"
 	default:
 		return status
 	}
@@ -197,9 +200,43 @@ func colorizeAutostartValue(autostart string, color bool) string {
 }
 
 // serviceStatusLine 查询服务的运行状态与开机自启状态，供菜单底部展示。
+// footerHasValidDeployment 判断是否有一份能让服务跑起来的配置：
+// 配置文件能读出且通过校验（LoadRoot 里含 validateRoot，缺 panel.url、
+// 缺 token、非法节点类型都会在这里失败），并且归一化后至少有一个实例。
+// 只读配置文件，不碰健康检查端口，所以菜单每次渲染都可调用。
+// 注意不走 install-meta.json 的兜底：配置本身坏了、服务起不来时，
+// 底部就不该因为一份陈旧的绑定记录而显示运行中。
+func footerHasValidDeployment() bool {
+	root, err := config.LoadRoot(defaultConfigPath)
+	if err != nil {
+		return false
+	}
+	instances, err := root.NormalizeInstances()
+	return err == nil && len(instances) > 0
+}
+
+// footerStatusText 把“配置是否有效 + systemctl 状态”折成菜单底部的
+// 显示，照 V2bX 的做法：没有启动中这种中间态。
+// 没配置（未部署、配置无效）叫未启动，不叫停止；配好了但服务没跑
+// 才叫停止；不管 systemd 报什么，没部署的机器上服务即使因配置错误
+// 在重启等待里报 activating，底部也不该显示启动中。
+func footerStatusText(validConfig bool, state string) string {
+	if !validConfig {
+		return "未启动"
+	}
+	switch state {
+	case "active":
+		return "运行中"
+	case "unknown", "":
+		return "未知"
+	default:
+		return "停止"
+	}
+}
+
 // systemctl 不可用或查询失败时分别显示未知与否，不阻塞菜单渲染。
 func serviceStatusLine() (status, autostart string) {
-	status = formatServiceStatus(systemctlState())
+	status = footerStatusText(footerHasValidDeployment(), systemctlState())
 	if err := exec.Command("systemctl", "is-enabled", serviceName).Run(); err == nil {
 		autostart = "是"
 	} else {
@@ -301,8 +338,20 @@ func runMenuLoop(in *bufio.Reader, out io.Writer) error {
 			if err := menuUninstall(in, out); err != nil {
 				fmt.Fprintf(out, "操作失败：%v\n", err)
 			}
+		case "13":
+			if err := runService([]string{"enable"}); err != nil {
+				fmt.Fprintf(out, "操作失败：%v\n", err)
+			} else {
+				fmt.Fprintln(out, "已开启开机自启。")
+			}
+		case "14":
+			if err := runService([]string{"disable"}); err != nil {
+				fmt.Fprintf(out, "操作失败：%v\n", err)
+			} else {
+				fmt.Fprintln(out, "已关闭开机自启。")
+			}
 		default:
-			fmt.Fprintln(out, "无效的选择，请输入 0-12 的编号。")
+			fmt.Fprintln(out, "无效的选择，请输入 0-14 的编号。")
 			continue
 		}
 		if err := pauseForMenu(in, out); err != nil {

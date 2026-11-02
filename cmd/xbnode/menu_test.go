@@ -174,9 +174,13 @@ func TestFormatServiceStatus(t *testing.T) {
 func TestColorizeStatusValue(t *testing.T) {
 	cases := map[string]string{
 		"已运行": "\x1b[32m已运行\x1b[0m",
+		"运行中": "\x1b[32m运行中\x1b[0m",
+		"启动中": "\x1b[32m启动中\x1b[0m",
 		"未运行": "\x1b[31m未运行\x1b[0m",
+		"未启动": "\x1b[31m未启动\x1b[0m",
+		"停止":  "\x1b[31m停止\x1b[0m",
+		"停止中": "\x1b[31m停止中\x1b[0m",
 		"异常":  "\x1b[31m异常\x1b[0m",
-		"启动中": "\x1b[33m启动中\x1b[0m",
 		"未知":  "未知",
 	}
 	for in, want := range cases {
@@ -192,6 +196,47 @@ func TestColorizeStatusValue(t *testing.T) {
 	}
 	if got := colorizeAutostartValue("否", true); got != "\x1b[31m否\x1b[0m" {
 		t.Errorf("colorizeAutostartValue(否) = %q", got)
+	}
+}
+
+func TestFooterStatusText(t *testing.T) {
+	cases := []struct {
+		valid bool
+		state string
+		want  string
+	}{
+		{true, "active", "运行中"},
+		{true, "inactive", "停止"},
+		{true, "failed", "停止"},
+		{true, "activating", "停止"},
+		{true, "deactivating", "停止"},
+		{true, "unknown", "未知"},
+		{true, "", "未知"},
+		{false, "active", "未启动"},
+		{false, "activating", "未启动"},
+		{false, "unknown", "未启动"},
+	}
+	for _, c := range cases {
+		if got := footerStatusText(c.valid, c.state); got != c.want {
+			t.Errorf("footerStatusText(%v, %q) = %q, want %q", c.valid, c.state, got, c.want)
+		}
+	}
+}
+
+// 提示范围与菜单项数量挂钩：加了 13/14 后提示必须是 [0-14]。
+func TestMenuPromptRange(t *testing.T) {
+	in := bufio.NewReader(strings.NewReader("0\n"))
+	var out bytes.Buffer
+	if err := runMenuLoop(in, &out); err != nil {
+		t.Fatalf("runMenuLoop: %v", err)
+	}
+	if !strings.Contains(out.String(), "请输入选项编号 [0-14]：") {
+		t.Errorf("prompt range not updated to [0-14]:\n%s", out.String())
+	}
+	for _, want := range []string{"13. 开启开机自启", "14. 关闭开机自启"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("menu output missing %q:\n%s", want, out.String())
+		}
 	}
 }
 
@@ -224,8 +269,8 @@ func testDisplayWidth(s string) int {
 func TestPrintMenuAlignment(t *testing.T) {
 	var out bytes.Buffer
 	printMenu(&out)
-	titles := []string{"安装/绑定节点", "绑定机器", "启动服务", "停止服务", "重启服务", "查看服务状态", "查看实例列表", "查看实时日志", "查看版本", "切换内核", "更新到最新版", "卸载"}
-	descs := []string{"填写面板地址、节点密钥", "填写面板地址、机器密钥", "启动 xboard-node", "停止 xboard-node", "重启 xboard-node", "服务、健康检查", "列出已绑定的节点", "跟随输出服务日志", "显示 xbnode 版本", "在 sing-box 与 xray 之间切换", "从发布页下载最新版", "停止并删除服务"}
+	titles := []string{"安装/绑定节点", "绑定机器", "启动服务", "停止服务", "重启服务", "查看服务状态", "查看实例列表", "查看实时日志", "查看版本", "切换内核", "更新到最新版", "卸载", "开启开机自启", "关闭开机自启"}
+	descs := []string{"填写面板地址、节点密钥", "填写面板地址、机器密钥", "启动 xboard-node", "停止 xboard-node", "重启 xboard-node", "服务、健康检查", "列出已绑定的节点", "跟随输出服务日志", "显示 xbnode 版本", "在 sing-box 与 xray 之间切换", "从发布页下载最新版", "停止并删除服务", "设置 xboard-node 开机自启", "取消 xboard-node 开机自启"}
 	var titleCol, descCol = -1, -1
 	for _, line := range strings.Split(out.String(), "\n") {
 		for i, title := range titles {
