@@ -61,13 +61,18 @@ type Xray struct {
 	instance        *xrayCore.Instance
 	limitDispatcher *LimitDispatcher
 	users           []model.UserSpec
-	nodeConfig      *model.NodeSpec
-	tls             kernel.TLSCert
-	protocol        string
-	inboundTag      string
-	lastKernelHash  string
-	cumTraffic      map[int][2]int64
-	speedLimitFunc  func(string) *rate.Limiter
+	// uuidEmails maps a user UUID to its session email ("user@<id>"). It is
+	// append-only on purpose: CloseUserConnections must still resolve a
+	// removed user's email after RemoveUsers/UpdateUsers dropped them from
+	// users, otherwise their live connections could never be found.
+	uuidEmails     map[string]string
+	nodeConfig     *model.NodeSpec
+	tls            kernel.TLSCert
+	protocol       string
+	inboundTag     string
+	lastKernelHash string
+	cumTraffic     map[int][2]int64
+	speedLimitFunc func(string) *rate.Limiter
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -90,7 +95,11 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
 		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		// ForceCloseUser is true now: CloseUserConnections closes the
+		// dispatcher's tracked writers for the user (see dispatcher.go).
+		// Per-connection close by ID is still unsupported, hence
+		// ForceCloseConnection stays false.
+		ForceCloseUser: true,
 	}
 }
 
@@ -162,6 +171,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
 	closeOld(old, oldLD)
 
+	x.rememberUserEmails(users)
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -177,6 +187,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	x.rememberUserEmails(users)
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -250,8 +261,39 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+// rememberUserEmails records UUID→session-email mappings. It never deletes
+// entries, so a removed user can still be resolved when their live
+// connections are force-closed after removal.
+func (x *Xray) rememberUserEmails(users []model.UserSpec) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.uuidEmails == nil {
+		x.uuidEmails = make(map[string]string)
+	}
+	for _, u := range users {
+		if u.UUID != "" {
+			x.uuidEmails[u.UUID] = userEmail(u.ID)
+		}
+	}
+}
+
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	if uuid == "" {
+		return nil
+	}
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	email := x.uuidEmails[uuid]
+	x.mu.Unlock()
+	if ld == nil {
+		return nil
+	}
+	// Session emails are normally "user@<id>"; close by that email, and
+	// also by the UUID itself in case a protocol used it as the email.
+	if email != "" {
+		ld.CloseUserConnections(email)
+	}
+	ld.CloseUserConnections(uuid)
 	return nil
 }
 
@@ -313,8 +355,9 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		// No new kernel users, but properties (limits) may have changed.
 		x.users = merged
 		x.mu.Unlock()
+		x.rememberUserEmails(merged)
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -353,6 +396,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	x.users = merged
 	x.mu.Unlock()
+	x.rememberUserEmails(merged)
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
 
@@ -441,6 +485,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		// Only limits changed — update dispatcher without restart.
 		x.users = users
 		x.mu.Unlock()
+		x.rememberUserEmails(users)
 		x.updateDispatcherLimits(users)
 		x.updateBandwidthLimits(users)
 		nlog.Core().Info("xray: limits updated, kernel unchanged")
@@ -486,6 +531,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	x.mu.Lock()
 	x.users = users
 	x.mu.Unlock()
+	x.rememberUserEmails(users)
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -574,8 +620,15 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 			// 2022-blake3 multi-user mode
 			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
 		} else {
-			// Traditional SS — build via getCipher path
-			ct := parseCipherType(nc.Cipher)
+			// Traditional SS — build via getCipher path. An unknown
+			// cipher is an error, not a silent AES-256-GCM default:
+			// the old default made clients fail with no server-side
+			// clue whenever the panel sent a cipher xray does not
+			// know (e.g. a typo or a new method).
+			ct, err := parseCipherType(nc.Cipher)
+			if err != nil {
+				return nil, err
+			}
 			cipherObj, err := (&shadowsocks.Account{CipherType: ct, Password: u.UUID}).AsAccount()
 			if err != nil {
 				return nil, fmt.Errorf("build ss account: %w", err)
@@ -591,20 +644,22 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 }
 
 // parseCipherType maps a cipher name string to the xray CipherType enum.
-func parseCipherType(cipher string) shadowsocks.CipherType {
+// Unknown ciphers (including empty) are an error: silently defaulting to
+// AES-256-GCM hid panel misconfiguration behind client-side failures.
+func parseCipherType(cipher string) (shadowsocks.CipherType, error) {
 	switch cipher {
 	case "aes-128-gcm":
-		return shadowsocks.CipherType_AES_128_GCM
+		return shadowsocks.CipherType_AES_128_GCM, nil
 	case "aes-256-gcm":
-		return shadowsocks.CipherType_AES_256_GCM
+		return shadowsocks.CipherType_AES_256_GCM, nil
 	case "chacha20-ietf-poly1305", "chacha20-poly1305":
-		return shadowsocks.CipherType_CHACHA20_POLY1305
+		return shadowsocks.CipherType_CHACHA20_POLY1305, nil
 	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
-		return shadowsocks.CipherType_XCHACHA20_POLY1305
+		return shadowsocks.CipherType_XCHACHA20_POLY1305, nil
 	case "none", "plain":
-		return shadowsocks.CipherType_NONE
+		return shadowsocks.CipherType_NONE, nil
 	default:
-		return shadowsocks.CipherType_AES_256_GCM
+		return shadowsocks.CipherType_UNKNOWN, fmt.Errorf("unsupported shadowsocks cipher %q", cipher)
 	}
 }
 

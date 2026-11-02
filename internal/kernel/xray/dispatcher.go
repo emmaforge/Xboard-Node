@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	_ "unsafe"
@@ -52,6 +54,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		inner:      orig,
 		innerDisp:  inner,
 		limitedIPs: make(map[string]map[string]int),
+		links:      make(map[string]map[*closeTrackingWriter]linkInfo),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -81,6 +84,20 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// links indexes live connections by session email so a removed user can
+	// be force-disconnected (CloseUserConnections). It is guarded by its own
+	// mutex: closing a writer runs its onClose callback, which deregisters
+	// the writer, so callers must snapshot under linkMu and close after
+	// releasing it, or they deadlock on re-entry.
+	linkMu sync.Mutex
+	links  map[string]map[*closeTrackingWriter]linkInfo // email → live writers
+}
+
+// linkInfo is one live connection in the links index.
+type linkInfo struct {
+	writer   *closeTrackingWriter
+	sourceIP string
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -103,73 +120,140 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, sourceIP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return nil, err
 	}
 
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
-		if email != "" && isTCP {
+		if email != "" {
 			d.delConn(email, sourceIP)
 		}
 		return nil, err
 	}
 
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		d.trackLink(link, email, sourceIP)
 	}
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, sourceIP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return err
 	}
 
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		w := d.trackLink(link, email, sourceIP)
+		if err := d.innerDisp.DispatchLink(ctx, dest, link); err != nil {
+			// Roll back the tracking added above: the link never got
+			// dispatched, so its writer must not stay registered or keep
+			// inflating the device/IP counts.
+			if w != nil {
+				w.Close()
+			}
+			return err
+		}
+		return nil
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
 
-// identifyAndCheck extracts user identity from the session context, enforces
-// device limits, and returns the user's email, source IP, and TCP flag.
-// Returns a non-nil error only when the connection should be rejected.
-func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, isTCP bool, err error) {
+// identifyAndCheck extracts user identity from the session context and
+// enforces device limits. Returns a non-nil error only when the connection
+// should be rejected. dest is accepted for future transport-aware checks;
+// device counting itself is transport-agnostic (see checkDeviceLimit).
+func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, err error) {
+	_ = dest
 	si := session.InboundFromContext(ctx)
 	if si == nil || si.User == nil || len(si.User.Email) == 0 {
-		return "", "", false, nil
+		return "", "", nil
 	}
 	email = si.User.Email
 	sourceIP = si.Source.Address.IP().String()
-	isTCP = dest.Network == net.Network_TCP
 
-	if d.checkDeviceLimit(email, sourceIP, isTCP) {
+	if d.checkDeviceLimit(email, sourceIP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
-		return "", "", false, errors.New("device limit exceeded for " + email)
+		return "", "", errors.New("device limit exceeded for " + email)
 	}
-	return email, sourceIP, isTCP, nil
+	return email, sourceIP, nil
 }
 
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing
-// the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+// the dispatcher to release device-limit state when the link closes. It
+// returns the tracking writer so callers can roll tracking back on a
+// failed dispatch, and registers it in links so CloseUserConnections can
+// force-close every live connection of a removed user.
+func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string) *closeTrackingWriter {
 	d.connCount.Add(1)
 
+	var w *closeTrackingWriter
 	onClose := func() {
-		if isTCP {
-			d.delConn(email, sourceIP)
-		}
+		// Always release the device/IP count, for TCP and UDP alike (see
+		// checkDeviceLimit: a dispatched Link is a session, not a packet).
+		d.delConn(email, sourceIP)
 		d.connCount.Add(-1)
+		if w != nil {
+			d.unregisterLink(email, w)
+		}
 	}
 
-	link.Writer = &closeTrackingWriter{
+	w = &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
 	}
+	link.Writer = w
+
+	d.linkMu.Lock()
+	if d.links == nil {
+		d.links = make(map[string]map[*closeTrackingWriter]linkInfo)
+	}
+	set, ok := d.links[email]
+	if !ok {
+		set = make(map[*closeTrackingWriter]linkInfo)
+		d.links[email] = set
+	}
+	set[w] = linkInfo{writer: w, sourceIP: sourceIP}
+	d.linkMu.Unlock()
+	return w
+}
+
+// unregisterLink removes a writer from the per-email live-connection index.
+// Called from the writer's onClose callback, so it must not be called while
+// linkMu is held.
+func (d *LimitDispatcher) unregisterLink(email string, w *closeTrackingWriter) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if set, ok := d.links[email]; ok {
+		delete(set, w)
+		if len(set) == 0 {
+			delete(d.links, email)
+		}
+	}
+}
+
+// CloseUserConnections force-closes every live connection registered under
+// the given session email. Writers are snapshotted under linkMu and closed
+// after releasing it, because closing a writer runs its onClose callback,
+// which re-enters unregisterLink. Returns the number of connections closed.
+func (d *LimitDispatcher) CloseUserConnections(email string) int {
+	if email == "" {
+		return 0
+	}
+	d.linkMu.Lock()
+	set := d.links[email]
+	writers := make([]*closeTrackingWriter, 0, len(set))
+	for w := range set {
+		writers = append(writers, w)
+	}
+	d.linkMu.Unlock()
+	for _, w := range writers {
+		w.Close()
+	}
+	return len(writers)
 }
 
 // ─── features.Feature (delegated) ───────────────────────────────────────────
@@ -205,6 +289,10 @@ func (d *LimitDispatcher) ResetConns() {
 	d.limitedIPs = make(map[string]map[string]int)
 	d.mu.Unlock()
 
+	d.linkMu.Lock()
+	d.links = make(map[string]map[*closeTrackingWriter]linkInfo)
+	d.linkMu.Unlock()
+
 	// Clear unlimited IPs
 	d.unlimitedIPs.Range(func(key, _ interface{}) bool {
 		d.unlimitedIPs.Delete(key)
@@ -239,6 +327,43 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 		}
 	}
 
+	// Collect IPs from the live-link index too. This matters for removed
+	// users: UpdateLimits drops them from emailToUID, so the limited/
+	// unlimited collections above would hide their surviving connections
+	// from the service's trackAndEnforce safety net. Session emails are
+	// "user@<id>", which parses back to a user ID; UUID-keyed emails
+	// cannot be mapped here and are handled by CloseUserConnections.
+	d.linkMu.Lock()
+	linkIPs := make(map[int]map[string]bool)
+	for email, set := range d.links {
+		if !strings.HasPrefix(email, "user@") {
+			continue
+		}
+		uid, err := strconv.Atoi(strings.TrimPrefix(email, "user@"))
+		if err != nil || uid <= 0 {
+			continue
+		}
+		for _, info := range set {
+			if info.sourceIP == "" {
+				continue
+			}
+			if linkIPs[uid] == nil {
+				linkIPs[uid] = make(map[string]bool)
+			}
+			linkIPs[uid][info.sourceIP] = true
+		}
+	}
+	d.linkMu.Unlock()
+	for uid, ips := range linkIPs {
+		if existing, ok := aliveIPs[uid]; ok {
+			for ip := range ips {
+				existing[ip] = true
+			}
+		} else {
+			aliveIPs[uid] = ips
+		}
+	}
+
 	// Collect IPs from unlimited users (lock-free).
 	d.unlimitedIPs.Range(func(key, value interface{}) bool {
 		email := key.(string)
@@ -269,21 +394,23 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 // checkDeviceLimit enforces per-user device limits.
 // Fast path: unlimited users use lock-free sync.Map.
 // Slow path: limited users use RWMutex with deterministic IP ordering.
-func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
+// checkDeviceLimit enforces per-user device limits. Every dispatched
+// session counts, TCP and UDP alike: a dispatcher Link represents one
+// session (not one packet), so excluding UDP let UDP/QUIC users open
+// unlimited devices. The old TCP-only counting is the B2 bug.
+func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 	d.mu.RLock()
 	limit, hasLimit := d.deviceLimits[email]
 	d.mu.RUnlock()
 
 	// Fast path: no device limit — use lock-free sync.Map.
 	if !hasLimit || limit <= 0 {
-		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
+		v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+		ic := v.(*ipCounter)
 
-			// Increment IP refcount atomically.
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
-		}
+		// Increment IP refcount atomically.
+		rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
+		rv.(*atomic.Int64).Add(1)
 		return false
 	}
 
@@ -292,24 +419,20 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	ips := d.limitedIPs[email]
 	if ips != nil && ips[sourceIP] > 0 {
 		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
+		d.mu.Lock()
+		d.limitedIPs[email][sourceIP]++
+		d.mu.Unlock()
 		return false
 	}
 
 	if ips != nil && len(ips) < limit {
 		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
+		d.mu.Lock()
+		if d.limitedIPs[email] == nil {
+			d.limitedIPs[email] = make(map[string]int)
 		}
+		d.limitedIPs[email][sourceIP]++
+		d.mu.Unlock()
 		return false
 	}
 	d.mu.RUnlock()
@@ -326,16 +449,12 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	}
 
 	if ips[sourceIP] > 0 {
-		if isTCP {
-			ips[sourceIP]++
-		}
+		ips[sourceIP]++
 		return false
 	}
 
 	if len(ips) < limit {
-		if isTCP {
-			ips[sourceIP]++
-		}
+		ips[sourceIP]++
 		return false
 	}
 
@@ -349,9 +468,7 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 
 	for i := 0; i < limit && i < len(ipList); i++ {
 		if ipList[i] == sourceIP {
-			if isTCP {
-				ips[sourceIP]++
-			}
+			ips[sourceIP]++
 			return false
 		}
 	}

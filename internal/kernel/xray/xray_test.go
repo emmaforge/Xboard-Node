@@ -169,7 +169,10 @@ func TestXrayCapabilities(t *testing.T) {
 	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if caps.ForceCloseConnection || caps.ForceCloseUser {
+	// ForceCloseUser is now true: CloseUserConnections closes the
+	// dispatcher's tracked writers. Per-connection close by ID is still
+	// unsupported, so ForceCloseConnection stays false.
+	if caps.ForceCloseConnection || !caps.ForceCloseUser {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
@@ -274,5 +277,20 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 	}
 	if x.IsRunning() {
 		t.Fatal("expected xray to stop when last user is removed")
+	}
+}
+
+func TestParseCipherTypeRejectsUnknown(t *testing.T) {
+	// Regression test for B9: unknown ciphers used to silently
+	// default to AES-256-GCM, hiding panel misconfiguration.
+	for _, c := range []string{"aes-256-gcm-typo", "rc4-md5", ""} {
+		if _, err := parseCipherType(c); err == nil {
+			t.Errorf("parseCipherType(%q) should error", c)
+		}
+	}
+	for _, c := range []string{"aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305", "none", "plain"} {
+		if _, err := parseCipherType(c); err != nil {
+			t.Errorf("parseCipherType(%q) should succeed, got %v", c, err)
+		}
 	}
 }
