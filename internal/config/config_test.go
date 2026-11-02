@@ -1,10 +1,15 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -541,5 +546,71 @@ func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
 	child.inheritFrom(parent)
 	if !child.Cert.AutoTLS {
 		t.Error("auto_tls should be inherited when child has no cert config")
+	}
+}
+
+func TestLoad_NegativeIntervalsRejected(t *testing.T) {
+	// Regression test for B8: negative intervals used to pass
+	// validation and panic at time.NewTicker during startup.
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"track_interval", "node:\n  track_interval: -1\n"},
+		{"device_report_interval", "node:\n  device_report_interval: -5\n"},
+		{"status_interval", "ws:\n  status_interval: -1\n"},
+		{"backoff_initial", "ws:\n  backoff_initial: -1\n"},
+		{"backoff_max", "ws:\n  backoff_max: -1\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTemp(t, "\npanel:\n  url: \"https://panel.example.com\"\n  token: \"x\"\n  node_id: 5\n  node_type: \"v2ray\"\nkernel:\n  type: singbox\n"+tc.yaml)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load should reject negative %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestLoad_WarnsOnInsecurePanelURL (B7): loading a config whose panel
+// URL is plain http must log a cleartext-token warning, while an https
+// panel URL must not. This is a warning only — http configs still load.
+func TestLoad_WarnsOnInsecurePanelURL(t *testing.T) {
+	var buf bytes.Buffer
+	nlog.Init(&buf, slog.LevelDebug, false)
+	defer nlog.Init(os.Stdout, slog.LevelInfo, false)
+
+	httpPath := writeTemp(t, `
+panel:
+  url: "http://panel.example.com"
+  token: "secret-token"
+  node_id: 5
+kernel:
+  type: singbox
+`)
+	if _, err := Load(httpPath); err != nil {
+		t.Fatalf("Load http config: %v", err)
+	}
+	if !strings.Contains(buf.String(), "plain http") {
+		t.Errorf("expected a plain-http warning in log output, got:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "secret-token") {
+		t.Errorf("warning output must not contain the token:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	httpsPath := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "secret-token"
+  node_id: 5
+kernel:
+  type: singbox
+`)
+	if _, err := Load(httpsPath); err != nil {
+		t.Fatalf("Load https config: %v", err)
+	}
+	if strings.Contains(buf.String(), "plain http") {
+		t.Errorf("https config must not warn about plain http, got:\n%s", buf.String())
 	}
 }

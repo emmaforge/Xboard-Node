@@ -239,6 +239,16 @@ func LoadRoot(path string) (*RootConfig, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
+	// Same B7 http warning as Load(): the main binary loads configs
+	// through LoadRoot, not Load, so both paths must warn.
+	if len(rc.Instances) == 0 {
+		rc.Config.warnOnInsecurePanelURL()
+	} else {
+		for i := range rc.Instances {
+			rc.Instances[i].warnOnInsecurePanelURL()
+		}
+	}
+
 	return rc, nil
 }
 
@@ -376,7 +386,34 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
+	cfg.warnOnInsecurePanelURL()
+
 	return cfg, nil
+}
+
+// warnOnInsecurePanelURL logs a startup warning when the panel is
+// reached over plain http.
+//
+// B7: the panel token is transmitted in cleartext on http — in the URL
+// query for GET requests and WebSocket handshakes, and in the JSON body
+// for POST requests — so anyone able to observe the traffic (or the
+// panel's access logs, which record query strings) can capture it. This
+// is a warning, not a rejection: existing http panels keep working, and
+// whether to require https is a separate decision that would break those
+// deployments. Standalone configs never contact a panel and are skipped;
+// invalid URLs are already rejected by validate(), so a parse failure
+// here is silently ignored.
+func (c *Config) warnOnInsecurePanelURL() {
+	if c.IsStandalone() {
+		return
+	}
+	u, err := url.Parse(strings.TrimSpace(c.Panel.URL))
+	if err != nil || u.Scheme == "" {
+		return
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		nlog.Core().Warn("panel.url uses plain http; the panel token is sent in cleartext (query parameter, as required by the Xboard panel protocol). Use https for the panel URL.", "panel", u.Host)
+	}
 }
 
 // envFirst returns the first non-empty value among the given env var names.
@@ -732,6 +769,25 @@ func (c *Config) validate() error {
 	}
 	if c.Node.PullInterval < 0 {
 		return fmt.Errorf("node.pull_interval must not be negative")
+	}
+	// B8: every other interval that feeds time.NewTicker must be checked
+	// too. A negative value used to slip through validation and panic
+	// the process at startup (time.NewTicker panics on non-positive
+	// durations), with no config error pointing at the cause.
+	if c.Node.TrackInterval < 0 {
+		return fmt.Errorf("node.track_interval must not be negative")
+	}
+	if c.Node.DeviceReportInterval < 0 {
+		return fmt.Errorf("node.device_report_interval must not be negative")
+	}
+	if c.WS.StatusInterval < 0 {
+		return fmt.Errorf("ws.status_interval must not be negative")
+	}
+	if c.WS.BackoffInitial < 0 {
+		return fmt.Errorf("ws.backoff_initial must not be negative")
+	}
+	if c.WS.BackoffMax < 0 {
+		return fmt.Errorf("ws.backoff_max must not be negative")
 	}
 	return nil
 }
