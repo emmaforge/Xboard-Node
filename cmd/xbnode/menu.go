@@ -67,21 +67,104 @@ func printMenu(out io.Writer) {
 	fmt.Fprintln(out, "  支持系统：Ubuntu、Debian、CentOS、RHEL、Rocky、AlmaLinux、Fedora")
 	fmt.Fprintln(out, "  支持架构：amd64、arm64（需要 systemd）")
 	fmt.Fprintln(out, "------------------------------------------------------------")
-	fmt.Fprintln(out, "  1. 安装/绑定节点        填写面板地址、节点密钥和节点 ID，完成首次绑定")
-	fmt.Fprintln(out, "  2. 绑定机器            填写面板地址、机器密钥和机器 ID，绑定一台机器")
-	fmt.Fprintln(out, "  3. 启动服务            启动 xboard-node systemd 服务")
-	fmt.Fprintln(out, "  4. 停止服务            停止 xboard-node systemd 服务（需确认）")
-	fmt.Fprintln(out, "  5. 重启服务            重启 xboard-node systemd 服务（需确认）")
-	fmt.Fprintln(out, "  6. 查看服务状态        服务、健康检查与实例一览")
-	fmt.Fprintln(out, "  7. 查看实例列表        列出已绑定的节点/机器实例")
-	fmt.Fprintln(out, "  8. 查看实时日志        跟随输出服务日志，按 Ctrl+C 退出（将结束菜单程序）")
-	fmt.Fprintln(out, "  9. 查看版本            显示 xbnode 版本")
-	fmt.Fprintln(out, "  10. 切换内核           在 sing-box 与 xray 之间切换（需确认并重启）")
-	fmt.Fprintln(out, "  11. 更新到最新版       从发布页下载最新版并替换二进制（需确认）")
-	fmt.Fprintln(out, "  12. 卸载              停止并删除服务与二进制，可选清除配置（需确认）")
-	fmt.Fprintln(out, "  0. 退出菜单")
+	// 序号右对齐（%2d）+ 标题按显示宽度补空格：中文算 2 列，手工数空格
+	// 会在两位数序号处错位（10/11/12 的标题右移一列），第 12 项的描述
+	// 列也曾差一列。这里统一算列宽，标题列固定 19 列，描述列固定 25 列。
+	menuItems := []struct {
+		num   int
+		title string
+		desc  string
+	}{
+		{1, "安装/绑定节点", "填写面板地址、节点密钥和节点 ID，完成首次绑定"},
+		{2, "绑定机器", "填写面板地址、机器密钥和机器 ID，绑定一台机器"},
+		{3, "启动服务", "启动 xboard-node systemd 服务"},
+		{4, "停止服务", "停止 xboard-node systemd 服务（需确认）"},
+		{5, "重启服务", "重启 xboard-node systemd 服务（需确认）"},
+		{6, "查看服务状态", "服务、健康检查与实例一览"},
+		{7, "查看实例列表", "列出已绑定的节点/机器实例"},
+		{8, "查看实时日志", "跟随输出服务日志，按 Ctrl+C 退出（将结束菜单程序）"},
+		{9, "查看版本", "显示 xbnode 版本"},
+		{10, "切换内核", "在 sing-box 与 xray 之间切换（需确认并重启）"},
+		{11, "更新到最新版", "从发布页下载最新版并替换二进制（需确认）"},
+		{12, "卸载", "停止并删除服务与二进制，可选清除配置（需确认）"},
+		{0, "退出菜单", ""},
+	}
+	for _, it := range menuItems {
+		if it.desc == "" {
+			fmt.Fprintf(out, "  %2d. %s\n", it.num, it.title)
+			continue
+		}
+		fmt.Fprintf(out, "  %2d. %s%s\n", it.num, padDisplay(it.title, 19), it.desc)
+	}
 	fmt.Fprintln(out, "=============================================================")
+	status, autostart := serviceStatusLine()
+	fmt.Fprintf(out, "xboard-node 状态：%s\n", status)
+	fmt.Fprintf(out, "是否开机自启：%s\n", autostart)
 	fmt.Fprint(out, "请输入选项编号 [0-12]：")
+}
+
+// displayWidth 返回字符串在终端里占的列数：中文及全角字符算 2 列，
+// 其余算 1 列。按字节或 rune 数补空格都会在中文标题处错位。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if isWideRune(r) {
+			w += 2
+		} else {
+			w++
+		}
+	}
+	return w
+}
+
+// isWideRune 判断一个 rune 是否为宽字符（东亚宽字符与全角字符）。
+func isWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115f) || r == 0x2329 || r == 0x232a ||
+		(r >= 0x2e80 && r <= 0xa4cf) || (r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) || (r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) || (r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) || (r >= 0x20000 && r <= 0x2fffd) ||
+		(r >= 0x30000 && r <= 0x3fffd)
+}
+
+// padDisplay 在字符串右侧补空格，使其显示宽度达到 width；
+// 已达到或超过时原样返回。
+func padDisplay(s string, width int) string {
+	if d := width - displayWidth(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// formatServiceStatus 把 systemctl is-active 的原始状态翻译成菜单里
+// 显示的中文状态。
+func formatServiceStatus(state string) string {
+	switch state {
+	case "active":
+		return "已运行"
+	case "failed":
+		return "异常"
+	case "activating":
+		return "启动中"
+	case "deactivating":
+		return "停止中"
+	case "unknown", "":
+		return "未知"
+	default:
+		return "未运行"
+	}
+}
+
+// serviceStatusLine 查询服务的运行状态与开机自启状态，供菜单底部展示。
+// systemctl 不可用或查询失败时分别显示未知与否，不阻塞菜单渲染。
+func serviceStatusLine() (status, autostart string) {
+	status = formatServiceStatus(systemctlState())
+	if err := exec.Command("systemctl", "is-enabled", serviceName).Run(); err == nil {
+		autostart = "是"
+	} else {
+		autostart = "否"
+	}
+	return status, autostart
 }
 
 // runMenuLoop 是可测试的菜单循环：输入输出均可注入，读到 EOF 即退出。

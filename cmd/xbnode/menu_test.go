@@ -154,6 +154,85 @@ func TestMenuPauseEOFIsCleanExit(t *testing.T) {
 	}
 }
 
+func TestFormatServiceStatus(t *testing.T) {
+	cases := map[string]string{
+		"active":       "已运行",
+		"failed":       "异常",
+		"activating":   "启动中",
+		"deactivating": "停止中",
+		"inactive":     "未运行",
+		"unknown":      "未知",
+		"":             "未知",
+	}
+	for in, want := range cases {
+		if got := formatServiceStatus(in); got != want {
+			t.Errorf("formatServiceStatus(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPrintMenuShowsServiceStatus(t *testing.T) {
+	var out bytes.Buffer
+	printMenu(&out)
+	if !strings.Contains(out.String(), "xboard-node 状态：") {
+		t.Fatalf("menu output missing service status line:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "是否开机自启：") {
+		t.Fatalf("menu output missing autostart line:\n%s", out.String())
+	}
+}
+
+// testDisplayWidth 与实现无关的列宽算法：中文/全角算 2 列，其余 1 列，
+// 用于断言菜单各行的标题列与描述列真正对齐，而不是只断言字面空格。
+func testDisplayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if (r >= 0x2e80 && r <= 0x9fff) || (r >= 0xff01 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6) || r == 0x3001 || r == 0xff08 || r == 0xff09 {
+			w += 2
+		} else {
+			w++
+		}
+	}
+	return w
+}
+
+func TestPrintMenuAlignment(t *testing.T) {
+	var out bytes.Buffer
+	printMenu(&out)
+	titles := []string{"安装/绑定节点", "绑定机器", "启动服务", "停止服务", "重启服务", "查看服务状态", "查看实例列表", "查看实时日志", "查看版本", "切换内核", "更新到最新版", "卸载"}
+	descs := []string{"填写面板地址、节点密钥", "填写面板地址、机器密钥", "启动 xboard-node", "停止 xboard-node", "重启 xboard-node", "服务、健康检查", "列出已绑定的节点", "跟随输出服务日志", "显示 xbnode 版本", "在 sing-box 与 xray 之间切换", "从发布页下载最新版", "停止并删除服务"}
+	var titleCol, descCol = -1, -1
+	for _, line := range strings.Split(out.String(), "\n") {
+		for i, title := range titles {
+			idx := strings.Index(line, title)
+			if idx < 0 {
+				continue
+			}
+			col := testDisplayWidth(line[:idx])
+			if titleCol < 0 {
+				titleCol = col
+			} else if col != titleCol {
+				t.Errorf("title %q starts at col %d, want %d (line %q)", title, col, titleCol, line)
+			}
+			didx := strings.Index(line, descs[i])
+			if didx < 0 {
+				t.Errorf("line for %q missing desc %q: %q", title, descs[i], line)
+				continue
+			}
+			dcol := testDisplayWidth(line[:didx])
+			if descCol < 0 {
+				descCol = dcol
+			} else if dcol != descCol {
+				t.Errorf("desc for %q starts at col %d, want %d (line %q)", title, dcol, descCol, line)
+			}
+		}
+	}
+	if titleCol < 0 || descCol < 0 {
+		t.Fatalf("did not find menu item lines in output:\n%s", out.String())
+	}
+}
+
 func TestMenuLogItemHonestCtrlCText(t *testing.T) {
 	var out bytes.Buffer
 	printMenu(&out)
