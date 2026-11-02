@@ -47,6 +47,7 @@ CLI_BINARY_SOURCE=""
 FORCE_RECONFIGURE=0
 PURGE=0
 YES=0
+INSTALL_ONLY=0
 ARCH=""
 OS=""
 DOWNLOAD_URL=""
@@ -169,16 +170,24 @@ usage() {
     status       显示当前安装状态
     help         显示本帮助
 
+  两种用法（二选一）：
+    只安装不绑定（先装后配，像 V2bX 一样）：
+      sudo bash install.sh
+      装完运行不带参数的 xbctl 打开中文交互菜单，选 1 绑定节点
+      或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID，
+      绑定后服务会自动重启。
+    安装时直接绑定：绑定信息必须一次给全，见下方必填项。
+
   模式（不指定时按 --node-id 或 --machine-id 自动判断）：
     --mode node      面板单节点模式（默认）
     --mode machine   面板机器模式
 
-  节点模式必填：
+  直接绑定时，节点模式必填：
     --panel, -a      面板地址
     --token, -t      面板服务端密钥
     --node-id, -n    节点 ID
 
-  机器模式必填：
+  直接绑定时，机器模式必填：
     --panel, -a       面板地址
     --token, -t       机器密钥
     --machine-id      机器 ID
@@ -197,10 +206,16 @@ usage() {
     --yes, -y           对破坏性操作做非交互确认
 
   示例：
+    sudo bash install.sh
+    xbctl
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --node-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh upgrade
     sudo bash install.sh uninstall --purge --yes
+
+  注意：绑定信息只给一部分（例如只给了面板地址、缺密钥或 ID）
+  会直接报错退出，不会按一半信息安装；要么补齐绑定参数，
+  要么不带绑定参数只安装、装完用 xbctl 菜单绑定。
 
 HELP
 }
@@ -408,15 +423,26 @@ validate_positive_int() {
     fi
 }
 
+# refuse_partial_binding <detail>: binding info must arrive either complete
+# or not at all. A half-configured install (panel without token, token
+# without ID, ...) is refused outright instead of being installed in a
+# broken state; the user picks one of the two supported usages.
+refuse_partial_binding() {
+    log_error "绑定信息不完整：$1"
+    log_error "正确用法（二选一）："
+    log_error "  1) 补齐绑定参数后安装，例如：sudo bash install.sh --panel <面板地址> --token <密钥> --node-id <节点 ID>"
+    log_error "  2) 不带绑定参数只安装二进制，装完运行 xbctl 打开中文交互菜单绑定：sudo bash install.sh"
+    exit 1
+}
+
+# validate_install_request classifies the install request into three cases
+# and sets INSTALL_ONLY accordingly:
+#   - no binding info at all (panel, token, node ID, machine ID all empty):
+#     install binaries only; binding happens later via the xbctl menu.
+#   - complete binding info for the selected mode: full install as before.
+#   - anything in between: refused via refuse_partial_binding.
+# Kernel and health-port are validated in all three cases.
 validate_install_request() {
-    if [ -z "$PANEL_URL" ]; then
-        log_error "必须提供面板地址"
-        exit 1
-    fi
-    if [ -z "$TOKEN" ]; then
-        log_error "必须提供密钥"
-        exit 1
-    fi
     if ! [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
         log_error "health-port 必须是非负整数"
         exit 1
@@ -431,11 +457,25 @@ validate_install_request() {
             exit 1
             ;;
     esac
+    if [ -z "$PANEL_URL" ] && [ -z "$TOKEN" ] && [ -z "$NODE_ID" ] && [ -z "$MACHINE_ID" ]; then
+        INSTALL_ONLY=1
+        return
+    fi
+    INSTALL_ONLY=0
+    if [ -z "$PANEL_URL" ] || [ -z "$TOKEN" ]; then
+        refuse_partial_binding "面板地址和密钥必须一起提供"
+    fi
     case "$MODE" in
         node)
+            if [ -z "$NODE_ID" ]; then
+                refuse_partial_binding "节点模式需要 --node-id"
+            fi
             validate_positive_int "Node ID" "$NODE_ID"
             ;;
         machine)
+            if [ -z "$MACHINE_ID" ]; then
+                refuse_partial_binding "机器模式需要 --machine-id"
+            fi
             validate_positive_int "Machine ID" "$MACHINE_ID"
             ;;
     esac
@@ -752,8 +792,56 @@ start_service() {
     fi
 }
 
+# install_staged_binaries_only: like install_staged_files but without
+# touching config, credentials or install metadata, and without stopping
+# or starting the service. Replacing a running executable via install(1)
+# is safe (the running process keeps the old inode); the new binary takes
+# effect on the next service restart (e.g. after menu binding).
+install_staged_binaries_only() {
+    install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
+    if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
+        install -m 755 "$0" "$INSTALLER_COPY_PATH"
+    fi
+    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+}
+
+# perform_install_only: install binaries + xbctl + service unit only, no
+# binding. Used when install runs without any panel/token/ID arguments
+# (V2bX-style "install first, bind later" flow). Existing config and
+# credentials are never touched, and the service is not started: with no
+# binding there is nothing valid for it to run, and starting it would
+# fail. Binding afterwards happens via the xbctl interactive menu
+# (option 1 node, option 2 machine), which restarts the service.
+perform_install_only() {
+    TMP_DIR=$(mktemp -d)
+    ensure_dirs
+    stage_binary
+    stage_xbctl
+    render_service
+    backup_existing_state
+    install_staged_binaries_only
+
+    log_info "安装完成（仅安装二进制，未绑定面板）"
+    if [ -f "$CONFIG_FILE" ]; then
+        log_info "已有配置已保留：${CONFIG_FILE}"
+    fi
+    log_info "服务单元已安装并设为开机自启：${SERVICE_NAME}（本次仅安装，不启动服务）"
+    log_info "请运行不带参数的 xbctl 打开中文交互菜单：xbctl"
+    log_info "在菜单里选 1 绑定节点，或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID"
+    log_info "绑定完成后服务会自动重启"
+    log_info "命令行工具：${CLI_PATH}（若 xbctl 不在 PATH 中，可运行 '${CLI_PATH} list'）"
+}
+
 perform_install() {
     validate_install_request
+    if [ "$INSTALL_ONLY" -eq 1 ]; then
+        perform_install_only
+        return
+    fi
     detect_current_state
     require_reconfigure_confirmation
     TMP_DIR=$(mktemp -d)
