@@ -67,8 +67,8 @@ func printMenu(out io.Writer) {
 	fmt.Fprintln(out, "  支持系统：Ubuntu、Debian、CentOS、RHEL、Rocky、AlmaLinux、Fedora")
 	fmt.Fprintln(out, "  支持架构：amd64、arm64（需要 systemd）")
 	fmt.Fprintln(out, "------------------------------------------------------------")
-	fmt.Fprintln(out, "  1. 安装/绑定节点        填写面板地址、密钥和节点 ID，完成首次绑定")
-	fmt.Fprintln(out, "  2. 绑定机器            填写面板地址、密钥和机器 ID，绑定一台机器")
+	fmt.Fprintln(out, "  1. 安装/绑定节点        填写面板地址、节点密钥和节点 ID，完成首次绑定")
+	fmt.Fprintln(out, "  2. 绑定机器            填写面板地址、机器密钥和机器 ID，绑定一台机器")
 	fmt.Fprintln(out, "  3. 启动服务            启动 xboard-node systemd 服务")
 	fmt.Fprintln(out, "  4. 停止服务            停止 xboard-node systemd 服务（需确认）")
 	fmt.Fprintln(out, "  5. 重启服务            重启 xboard-node systemd 服务（需确认）")
@@ -323,17 +323,18 @@ func promptKernel(in *bufio.Reader, out io.Writer) (string, error) {
 }
 
 // promptPanelAndToken 收集面板地址和密钥；密钥只校验非空，
-// 从不在任何输出里回显原文。
-func promptPanelAndToken(in *bufio.Reader, out io.Writer) (string, string, error) {
+// 从不在任何输出里回显原文。tokenLabel 区分密钥种类：节点绑定用
+// “节点密钥”，机器绑定用“机器密钥”，避免与面板通信密钥混淆。
+func promptPanelAndToken(in *bufio.Reader, out io.Writer, tokenLabel string) (string, string, error) {
 	panelURL, err := promptString(in, out, "请输入面板地址（例如 https://panel.example.com）", true, "", validatePanelURL)
 	if err != nil {
 		return "", "", err
 	}
 	if u, err := url.Parse(panelURL); err == nil && u.Scheme == "http" {
-		fmt.Fprintln(out, "提示：面板地址使用了明文 http，面板密钥在传输中可见，建议改用 https。")
+		fmt.Fprintf(out, "提示：面板地址使用了明文 http，%s在传输中可见，建议改用 https。\n", tokenLabel)
 	}
-	fmt.Fprintln(out, "请输入面板密钥（输入时会在屏幕上回显，输完请注意清屏）：")
-	token, err := promptString(in, out, "面板密钥", true, "", nil)
+	fmt.Fprintf(out, "请输入%s（输入时会在屏幕上回显，输完请注意清屏）：\n", tokenLabel)
+	token, err := promptString(in, out, tokenLabel, true, "", nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -345,7 +346,7 @@ func menuBindNode(in *bufio.Reader, out io.Writer) error {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return fmt.Errorf("不支持的架构 %s，仅支持 amd64/arm64", runtime.GOARCH)
 	}
-	panelURL, token, err := promptPanelAndToken(in, out)
+	panelURL, token, err := promptPanelAndToken(in, out, "节点密钥")
 	if err != nil {
 		return err
 	}
@@ -384,7 +385,7 @@ func menuBindMachine(in *bufio.Reader, out io.Writer) error {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return fmt.Errorf("不支持的架构 %s，仅支持 amd64/arm64", runtime.GOARCH)
 	}
-	panelURL, token, err := promptPanelAndToken(in, out)
+	panelURL, token, err := promptPanelAndToken(in, out, "机器密钥")
 	if err != nil {
 		return err
 	}
