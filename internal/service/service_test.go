@@ -15,8 +15,35 @@ import (
 	"golang.org/x/time/rate"
 )
 
+type fakeCertManager struct {
+	cert        kernel.TLSCert
+	renewed     bool
+	fileChanged bool
+}
+
+func (f *fakeCertManager) Start(context.Context) error { return nil }
+func (f *fakeCertManager) Stop()                       {}
+func (f *fakeCertManager) Reconfigure(context.Context, config.CertConfig) (bool, error) {
+	return false, nil
+}
+func (f *fakeCertManager) TLSCert() kernel.TLSCert { return f.cert }
+func (f *fakeCertManager) CertRenewed() bool {
+	r := f.renewed
+	f.renewed = false
+	return r
+}
+func (f *fakeCertManager) HasCert() bool { return len(f.cert.CertPEM) > 0 }
+func (f *fakeCertManager) CheckFileChanged() bool {
+	c := f.fileChanged
+	f.fileChanged = false
+	return c
+}
+
 type fakeKernel struct {
 	running bool
+
+	reloadCalls   int
+	lastReloadTLS kernel.TLSCert
 
 	startErr  error
 	updateErr error
@@ -28,7 +55,7 @@ type fakeKernel struct {
 	removeCalls int
 	closeCalls  int
 
-	closedUUIDs []string
+	closedUUIDs  []string
 	trafficAlive map[int]map[string]bool
 
 	onUpdateUsers func([]model.UserSpec)
@@ -39,8 +66,8 @@ type fakeKernel struct {
 	deviceLimitFunc func(string) (int, bool)
 }
 
-func (f *fakeKernel) Name() string { return "fake" }
-func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
+func (f *fakeKernel) Name() string                      { return "fake" }
+func (f *fakeKernel) Protocols() []string               { return []string{"vless"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -51,10 +78,12 @@ func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	f.running = true
 	return nil
 }
-func (f *fakeKernel) Stop() { f.running = false }
+func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	_, _, _ = nodeConfig, users, tls
+	f.reloadCalls++
+	f.lastReloadTLS = tls
+	_, _ = nodeConfig, users
 	return nil
 }
 func (f *fakeKernel) AddUsers(users []model.UserSpec) (int, error) {
@@ -99,9 +128,9 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
-func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
-func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
-func (f *fakeKernel) ClearGlobalDevices() {}
+func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
+func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
+func (f *fakeKernel) ClearGlobalDevices()                                  {}
 
 func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()
@@ -205,7 +234,6 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 		t.Fatal("expected limiter for delta-added user after successful update")
 	}
 }
-
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
@@ -379,5 +407,55 @@ func TestTrackAndEnforceClosesStrayRemovedUserConnections(t *testing.T) {
 
 	if len(k.closedUUIDs) != 1 || k.closedUUIDs[0] != "uuid-old" {
 		t.Fatalf("CloseUserConnections calls = %v, want [uuid-old] only", k.closedUUIDs)
+	}
+}
+
+// TestTrackAndEnforce_CertRenewalReloadsKernel covers the WS-connected
+// renewal gap: a renewed certificate (or a changed file-mode pair) must
+// reload the kernel on the track tick, a stale flag for already-applied
+// material must not cause a second reload, and no reload happens when
+// the kernel is not running.
+func TestTrackAndEnforce_CertRenewalReloadsKernel(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 4}})
+
+	oldTLS := kernel.TLSCert{CertPEM: []byte("old-cert"), KeyPEM: []byte("old-key")}
+	newTLS := kernel.TLSCert{CertPEM: []byte("new-cert"), KeyPEM: []byte("new-key")}
+	fc := &fakeCertManager{cert: newTLS, renewed: true}
+	s.cert = fc
+	s.appliedState.TLS = oldTLS
+
+	s.trackAndEnforce(context.Background())
+	if k.reloadCalls != 1 || string(k.lastReloadTLS.CertPEM) != "new-cert" {
+		t.Fatalf("reloadCalls=%d lastCert=%q, want 1 / new-cert", k.reloadCalls, k.lastReloadTLS.CertPEM)
+	}
+	if string(s.appliedState.TLS.CertPEM) != "new-cert" {
+		t.Fatalf("applied TLS not updated: %q", s.appliedState.TLS.CertPEM)
+	}
+
+	// Stale flag, same material: no second reload.
+	fc.renewed = true
+	s.trackAndEnforce(context.Background())
+	if k.reloadCalls != 1 {
+		t.Fatalf("stale renewal flag caused a second reload: %d calls", k.reloadCalls)
+	}
+
+	// File-mode change with new material: reloads again.
+	newerTLS := kernel.TLSCert{CertPEM: []byte("newer-cert"), KeyPEM: []byte("newer-key")}
+	fc.cert = newerTLS
+	fc.fileChanged = true
+	s.trackAndEnforce(context.Background())
+	if k.reloadCalls != 2 || string(k.lastReloadTLS.CertPEM) != "newer-cert" {
+		t.Fatalf("file change: reloadCalls=%d lastCert=%q, want 2 / newer-cert", k.reloadCalls, k.lastReloadTLS.CertPEM)
+	}
+
+	// Kernel stopped: flags are consumed but no reload is attempted.
+	k.running = false
+	fc.renewed = true
+	s.trackAndEnforce(context.Background())
+	if k.reloadCalls != 2 {
+		t.Fatalf("reload attempted while kernel stopped: %d calls", k.reloadCalls)
 	}
 }

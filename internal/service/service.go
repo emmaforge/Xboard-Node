@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -28,6 +29,19 @@ import (
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
 
+// certManager is the certificate surface Service depends on. The concrete
+// *cert.Manager implements it; tests substitute a fake so renewal and
+// file-change handling can be exercised without ACME.
+type certManager interface {
+	Start(context.Context) error
+	Stop()
+	Reconfigure(context.Context, config.CertConfig) (bool, error)
+	TLSCert() kernel.TLSCert
+	CertRenewed() bool
+	HasCert() bool
+	CheckFileChanged() bool
+}
+
 type Service struct {
 	cfg          *config.Config
 	source       controlplane.Source
@@ -36,7 +50,7 @@ type Service struct {
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
-	cert         *cert.Manager
+	cert         certManager
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -57,6 +71,7 @@ type Service struct {
 	appliedState struct {
 		Config *model.NodeSpec
 		Users  []model.UserSpec
+		TLS    kernel.TLSCert
 	}
 
 	pushInterval int // seconds
@@ -162,10 +177,10 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	st := limiter.NewSpeedTracker(l)
 
 	return &Service{
-		cfg:          cfg,
-		source:       cp,
-		sink:         cp,
-		kernel:       k,
+		cfg:    cfg,
+		source: cp,
+		sink:   cp,
+		kernel: k,
 		// Speed calculation must divide by the actual track tick, not a
 		// hardcoded 10s (B4). NewWithInterval falls back to 10s when the
 		// config value is unset or invalid.
@@ -749,6 +764,7 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	s.appliedState.TLS = s.cert.TLSCert()
 
 	// Initialize node logger on first successful start
 	if s.nodeLog == nil {
@@ -993,6 +1009,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 		} else {
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
+			s.appliedState.TLS = s.cert.TLSCert()
 			if s.nodeLog != nil {
 				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 			}
@@ -1003,6 +1020,43 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 }
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
+	// Certificate freshness, independent of the panel transport.
+	// CertRenewed is otherwise only consumed by the REST pull path,
+	// which the main loop skips while WS is connected, so a renewed
+	// certificate would sit in memory unused until the next WS
+	// disruption. File-mode material has the same gap (no watcher).
+	// Checking here, on the main loop's track tick (10s default),
+	// closes both gaps. The applied-TLS comparison guards against a
+	// stale flag (e.g. a Reconfigure restart already applied the new
+	// certificate) causing a second, needless kernel reload.
+	certUpdated := false
+	if s.cert != nil {
+		if s.cert.CertRenewed() {
+			certUpdated = true
+		}
+		if s.cert.CheckFileChanged() {
+			certUpdated = true
+		}
+	}
+	if certUpdated && s.kernel.IsRunning() {
+		s.metricsMu.RLock()
+		cfg, users := s.lastConfig, s.lastUsers
+		s.metricsMu.RUnlock()
+		if cfg != nil && len(users) > 0 {
+			newTLS := s.cert.TLSCert()
+			if !bytes.Equal(newTLS.CertPEM, s.appliedState.TLS.CertPEM) ||
+				!bytes.Equal(newTLS.KeyPEM, s.appliedState.TLS.KeyPEM) {
+				nlog.Core().Info("certificate changed, reloading kernel with new material")
+				if err := s.kernel.Reload(cfg, users, newTLS); err != nil {
+					nlog.Core().Warn(fmt.Sprintf("cert reload failed, restarting: %v", err))
+					s.startKernel(cfg, users)
+				} else {
+					s.appliedState.TLS = newTLS
+				}
+			}
+		}
+	}
+
 	if !s.kernel.IsRunning() {
 		return
 	}

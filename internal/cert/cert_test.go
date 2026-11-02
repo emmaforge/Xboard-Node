@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -197,6 +198,8 @@ func TestACMEFingerprint(t *testing.T) {
 		{"provider", func(c *config.CertConfig) { c.DNSProvider = "alidns" }, true},
 		{"env_value", func(c *config.CertConfig) { c.DNSEnv = map[string]string{"CLOUDFLARE_API_TOKEN": "other"} }, true},
 		{"env_key_only", func(c *config.CertConfig) { c.DNSEnv = map[string]string{"OTHER": "tok"} }, true},
+		{"http_port", func(c *config.CertConfig) { c.HTTPPort = 8080 }, true},
+		{"cert_dir", func(c *config.CertConfig) { c.CertDir = "/other/certs" }, true},
 	}
 
 	baseFp := acmeFingerprint(base)
@@ -296,5 +299,90 @@ func TestReconfigureFailureRestartsOldACMEInstance(t *testing.T) {
 	}
 	if !m.HasCert() {
 		t.Error("expected old certificate material to survive failed reconfigure")
+	}
+}
+
+// TestStartSelfSigned_DomainMismatchRegenerates covers the stale-domain
+// bug: a persisted self-signed cert for domain A must not be served after
+// the configured domain changes to B, even though the key pair is valid.
+func TestStartSelfSigned_DomainMismatchRegenerates(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m1 := NewManager(config.CertConfig{CertMode: "self", Domain: "a.example.com", CertDir: dir})
+	if err := m1.Start(ctx); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	m2 := NewManager(config.CertConfig{CertMode: "self", Domain: "b.example.com", CertDir: dir})
+	if err := m2.Start(ctx); err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+	block, _ := pem.Decode(m2.TLSCert().CertPEM)
+	if block == nil {
+		t.Fatal("no PEM after regeneration")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse regenerated cert: %v", err)
+	}
+	for _, name := range cert.DNSNames {
+		if name == "a.example.com" {
+			t.Fatal("stale domain A cert was reused after domain change")
+		}
+	}
+	found := false
+	for _, name := range cert.DNSNames {
+		if name == "b.example.com" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("regenerated cert does not cover domain B: %v", cert.DNSNames)
+	}
+}
+
+// TestCheckFileChanged covers file-mode renewal pickup: external tools
+// replacing the cert/key files must be noticed, while a mere rewrite of
+// identical content must not trigger a reload.
+func TestCheckFileChanged(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	certA, keyA := generateSelfSignedPair(t, "f.example.com")
+	if err := os.WriteFile(certPath, certA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyA, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(config.CertConfig{CertMode: "file", CertFile: certPath, KeyFile: keyPath, CertDir: t.TempDir()})
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if m.CheckFileChanged() {
+		t.Fatal("unchanged files reported as changed")
+	}
+	// Same content, new mtime: must not count as a change.
+	if err := os.WriteFile(certPath, certA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if m.CheckFileChanged() {
+		t.Fatal("identical rewrite reported as changed")
+	}
+	// Genuinely new pair: must be picked up.
+	certB, keyB := generateSelfSignedPair(t, "g.example.com")
+	if err := os.WriteFile(certPath, certB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyB, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !m.CheckFileChanged() {
+		t.Fatal("changed files were not detected")
+	}
+	if string(m.TLSCert().CertPEM) != string(certB) {
+		t.Fatal("material was not reloaded to the new pair")
+	}
+	if m.CheckFileChanged() {
+		t.Fatal("second check after reload reported a change")
 	}
 }

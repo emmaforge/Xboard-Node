@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,27 @@ type Manager struct {
 	acmeStarted     bool
 	acmeFingerprint string
 	acmeCancel      context.CancelFunc
+
+	// fileStat records the cert/key files last loaded in file mode, so
+	// CheckFileChanged can notice an external renewal (e.g. certbot
+	// replacing the files) without any file watcher.
+	fileCertStat fileStat
+	fileKeyStat  fileStat
+}
+
+// fileStat is a cheap identity for a cert/key file on disk.
+type fileStat struct {
+	mtime time.Time
+	size  int64
+	ok    bool
+}
+
+func statFile(path string) fileStat {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStat{}
+	}
+	return fileStat{mtime: fi.ModTime(), size: fi.Size(), ok: true}
 }
 
 // certMaterial is an immutable snapshot of PEM-encoded cert + key.
@@ -215,6 +237,10 @@ func acmeFingerprint(cfg config.CertConfig) string {
 	b.WriteByte('|')
 	b.WriteString(strings.TrimSpace(cfg.DNSProvider))
 	b.WriteByte('|')
+	b.WriteString(strconv.Itoa(cfg.HTTPPort))
+	b.WriteByte('|')
+	b.WriteString(strings.TrimSpace(cfg.CertDir))
+	b.WriteByte('|')
 	for _, k := range keys {
 		b.WriteString(k)
 		b.WriteByte('=')
@@ -330,21 +356,81 @@ func (m *Manager) startFile() error {
 		return fmt.Errorf("invalid certificate pair: %w", err)
 	}
 	m.storePEM(certPEM, keyPEM)
+	m.fileCertStat = statFile(m.cfg.CertFile)
+	m.fileKeyStat = statFile(m.cfg.KeyFile)
 	nlog.Core().Debug("TLS certificate loaded from files", "cert", m.cfg.CertFile, "key", m.cfg.KeyFile)
 	return nil
 }
 
+// CheckFileChanged reloads file-mode material when the cert/key files
+// changed on disk since they were last loaded. It is a no-op unless the
+// resolved mode is "file". Without it, an external renewal that replaces
+// the files would never be picked up: file mode has no watcher and the
+// material is otherwise only loaded once at Start. Stat errors and reload
+// failures keep the old material and report false, so a transient disk
+// error can never wedge serving. Returns true only when the PEM material
+// actually changed.
+func (m *Manager) CheckFileChanged() bool {
+	if m.resolveMode() != "file" {
+		return false
+	}
+	if statFile(m.cfg.CertFile) == m.fileCertStat && statFile(m.cfg.KeyFile) == m.fileKeyStat {
+		return false
+	}
+	old := m.TLSCert()
+	if err := m.startFile(); err != nil {
+		nlog.Core().Warn("cert: failed to reload changed files, keeping old material", "error", err)
+		return false
+	}
+	return !pemEqual(old, m.TLSCert())
+}
+
 // ─── Mode: self ────────────────────────────────────────────────────────────
 
-func (m *Manager) startSelfSigned() error {
-	// Reuse persisted self-signed cert if available and valid.
-	if m.loadPersistedPEM() {
-		return nil
+// persistedCertMatchesDomain reports whether a PEM certificate covers
+// domain, via SAN DNS names, SAN IPs, or (legacy) the CommonName. Used to
+// stop self-signed mode from serving a stale persisted certificate after
+// the configured domain changed: loadPersistedPEM only checks the key
+// pair is valid, not that it belongs to this domain.
+func persistedCertMatchesDomain(certPEM []byte, domain string) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
 	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	if ip := net.ParseIP(domain); ip != nil {
+		for _, cip := range cert.IPAddresses {
+			if cip.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, name := range cert.DNSNames {
+		if name == domain {
+			return true
+		}
+	}
+	return cert.Subject.CommonName == domain
+}
 
+func (m *Manager) startSelfSigned() error {
 	domain := m.cfg.Domain
 	if domain == "" {
 		domain = "localhost"
+	}
+
+	// Reuse persisted self-signed cert only if it is valid AND covers
+	// the configured domain; otherwise regenerate instead of serving a
+	// certificate clients will reject for the wrong name.
+	if m.loadPersistedPEM() {
+		if mat := m.mat.Load(); mat != nil && persistedCertMatchesDomain(mat.certPEM, domain) {
+			return nil
+		}
+		nlog.Core().Warn("cert: persisted self-signed cert does not match domain, regenerating", "domain", domain)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
