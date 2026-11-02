@@ -3,10 +3,12 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -116,9 +118,63 @@ type WSClient struct {
 
 	connected atomic.Bool
 
+	// mu guards writeCh. Senders must hold mu (read lock) for the
+	// whole check-and-enqueue step, and connect()'s disconnect
+	// cleanup must hold mu (write lock) while clearing writeCh, so
+	// a sender can never observe a half-updated channel, send to a
+	// channel that has just been orphaned, or race with the clear.
+	// writeCh itself is only ever drained by connect()'s main loop.
+	mu sync.RWMutex
 	// writeCh allows sending messages from outside the connect loop.
-	// It is set in connect() and cleared on disconnect.
+	// Ordering (startup): the channel is created and stored here
+	// BEFORE connected is set to true, so a sender that sees
+	// connected==true always finds a usable channel (or a nil
+	// channel during the brief disconnect window, which trySend
+	// reports as an error instead of silently dropping).
+	// Ordering (disconnect): connect()'s deferred cleanup clears
+	// writeCh while connected is still true; senders in that window
+	// get errWSNoWriteChannel, and Run() then flips connected to
+	// false. A message enqueued just before the read loop exits
+	// may still be left undrained in the old channel — the loop is
+	// the only drainer, so exactly-once delivery across a
+	// disconnect is not guaranteed; callers must treat a nil
+	// return as "queued", not "delivered", and retry on the next
+	// connection (see the service-layer device-report recovery).
 	writeCh chan wsMessage
+}
+
+// Send failures reported by trySend / SendDeviceReport*.
+var (
+	errWSNotConnected     = errors.New("ws: not connected")
+	errWSNoWriteChannel   = errors.New("ws: write channel unavailable")
+	errWSWriteChannelFull = errors.New("ws: write channel full, message dropped")
+)
+
+// trySend enqueues msg for connect()'s main loop, or reports why it
+// could not be queued. It never blocks and never panics on a nil or
+// concurrently-cleared channel: the connected flag and the channel
+// are re-checked while holding mu, and the non-blocking send happens
+// under the same read lock that disconnect cleanup must take as a
+// write lock before clearing writeCh.
+func (w *WSClient) trySend(msg wsMessage) error {
+	if !w.connected.Load() {
+		return errWSNotConnected
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if !w.connected.Load() {
+		return errWSNotConnected
+	}
+	ch := w.writeCh
+	if ch == nil {
+		return errWSNoWriteChannel
+	}
+	select {
+	case ch <- msg:
+		return nil
+	default:
+		return errWSWriteChannelFull
+	}
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -233,11 +289,27 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	conn.SetReadLimit(10 << 20) // 10MB max message size
 
+	// Half-open / dead-peer detection, part 1: the first message
+	// must arrive within the handshake timeout. Without a read
+	// deadline, a peer that accepts the TCP/WS handshake and then
+	// never speaks would block connect() forever and Run() would
+	// never back off or reconnect. Reuses HandshakeTimeout so the
+	// first read has the same budget as the handshake itself.
+	handshakeTimeout := w.cfg.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 15 * time.Second
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return fmt.Errorf("set first read deadline: %w", err)
+	}
 	// Read first message — expect auth.success or error
 	var firstMsg wsMessage
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
+	// First message arrived; the loop below installs its own
+	// heartbeat deadline, so clear the one-shot deadline here.
+	_ = conn.SetReadDeadline(time.Time{})
 	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
 
 	if firstMsg.Event == "error" {
@@ -250,26 +322,60 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("auth failed: %s", errData.Message)
 	}
 
+	// writeCh decouples data collection from network I/O.
+	// It MUST be stored before connected is set to true: the old
+	// order (connected first, writeCh second, both unsynchronised)
+	// let a concurrent sender see connected==true with writeCh
+	// still nil and silently drop its message via the default case
+	// of a send on a nil channel, besides racing with the
+	// disconnect clear under -race.
+	writeCh := make(chan wsMessage, 16)
+	w.mu.Lock()
+	w.writeCh = writeCh
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.writeCh = nil
+		w.mu.Unlock()
+	}()
+
+	w.connected.Store(true)
+	w.notifyStatus(true)
 	if firstMsg.Event != "auth.success" {
 		// It might be a data event already (server pushed sync before auth.success)
 		// Process it and continue
-		w.connected.Store(true)
-		w.notifyStatus(true)
 		w.handleMessage(firstMsg)
-	} else {
-		w.connected.Store(true)
-		w.notifyStatus(true)
+	}
+
+	// Half-open / dead-peer detection, part 2: heartbeat read
+	// deadline. The loop refreshes the deadline on every inbound
+	// frame (control pong via the handler below, and any data /
+	// app-level ping message after a successful read), so a peer
+	// that stops speaking — including a half-open TCP connection
+	// where writes still appear to succeed — makes ReadJSON fail
+	// with a timeout after pongWait, which the main loop turns
+	// into a disconnect and Run() turns into a reconnect. The
+	// tolerance is a few heartbeat periods, not one, so one missed
+	// tick does not kill a healthy connection.
+	pongWait := 3 * w.cfg.StatusInterval
+	if pongWait <= 0 {
+		pongWait = 30 * time.Second
+	}
+	conn.SetPongHandler(func(string) error {
+		// Pong arrived: the peer is alive; extend the deadline.
+		// Errors from SetReadDeadline are ignored here because
+		// the in-flight ReadJSON will surface a failure anyway.
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return fmt.Errorf("set read deadline: %w", err)
 	}
 
 	// Ping interval: send pong responses to server pings.
 	// We also use this timer to trigger periodic status pushes.
 	reportTicker := time.NewTicker(w.cfg.StatusInterval)
 	defer reportTicker.Stop()
-
-	// writeCh decouples data collection from network I/O.
-	writeCh := make(chan wsMessage, 16)
-	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -284,6 +390,11 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
+			// Any inbound message proves the peer is alive, even
+			// if it never sends a control pong: extend the
+			// deadline so a chatty-but-pongless peer is not
+			// mistaken for a dead one.
+			_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
 			w.handleMessage(msg)
 			if msg.Event == "ping" {
@@ -309,6 +420,17 @@ func (w *WSClient) connect(ctx context.Context) error {
 			return fmt.Errorf("read: %w", err)
 
 		case <-reportTicker.C:
+			// Heartbeat probe: a control ping elicits a pong from
+			// a live peer, which refreshes the read deadline
+			// above. A dead peer never pongs, so the deadline
+			// expires and the connection is re-established by
+			// Run(). A ping write failure is fatal for this
+			// connection (unlike a merely-full status queue).
+			// The main loop is the only goroutine writing to
+			// conn, so this cannot interleave with WriteJSON.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return fmt.Errorf("ping: %w", err)
+			}
 			// Send periodic node.status via WebSocket
 			if w.onPing != nil {
 				msg := wsMessage{Event: "node.status"}
@@ -458,17 +580,19 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 }
 
 // SendDeviceReport sends local device snapshot to panel via WS.
-func (w *WSClient) SendDeviceReport(devices map[int][]string) {
-	w.SendDeviceReportForNode(0, devices)
+// It reports failure instead of silently dropping: a non-nil error
+// means the snapshot was NOT queued (not connected, no write
+// channel, channel full, or marshal failure) so the caller — the
+// service layer's device-report recovery — can retry it later.
+// A nil error means only that the message was queued for
+// connect()'s loop, not that the panel received it.
+func (w *WSClient) SendDeviceReport(devices map[int][]string) error {
+	return w.SendDeviceReportForNode(0, devices)
 }
 
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
-func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) {
-	if !w.connected.Load() {
-		return
-	}
-
+func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) error {
 	var payload interface{}
 	if nodeID > 0 {
 		payload = map[string]interface{}{"node_id": nodeID, "devices": devices}
@@ -478,7 +602,7 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 
 	d, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return fmt.Errorf("ws: marshal device report: %w", err)
 	}
 	msg := wsMessage{
 		Event:     WSEventReportDevices,
@@ -486,16 +610,24 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping device report")
+	if err := w.trySend(msg); err != nil {
+		// Keep the old log behaviour: only a full channel is
+		// worth a warning; not-connected / no-channel is the
+		// normal disconnected state and the returned error is
+		// what the caller acts on.
+		if errors.Is(err, errWSWriteChannelFull) {
+			nlog.Core().Warn("ws write channel full, skipping device report")
+		}
+		return err
 	}
+	return nil
 }
 
 // SendNodeStatus sends a node.status event with the given node_id (machine mode).
+// Signature intentionally unchanged; failures are only logged, as before,
+// but the send itself now goes through the mutex-protected trySend.
 func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
-	if !w.connected.Load() || stats == nil {
+	if stats == nil {
 		return
 	}
 	if nodeID > 0 {
@@ -507,28 +639,21 @@ func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
-	select {
-	case w.writeCh <- msg:
-	default:
+	if err := w.trySend(msg); err != nil && errors.Is(err, errWSWriteChannelFull) {
 		nlog.Core().Warn("ws write channel full, skipping node status")
 	}
 }
 
 // SendRaw sends a raw message to the panel via WebSocket.
+// Signature intentionally unchanged; failures are only logged, as before,
+// but the send itself now goes through the mutex-protected trySend.
 func (w *WSClient) SendRaw(event string, data json.RawMessage) {
-	if !w.connected.Load() {
-		return
-	}
-
 	msg := wsMessage{
 		Event:     event,
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
-
-	select {
-	case w.writeCh <- msg:
-	default:
+	if err := w.trySend(msg); err != nil && errors.Is(err, errWSWriteChannelFull) {
 		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
 	}
 }

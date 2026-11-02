@@ -55,6 +55,17 @@ type Service struct {
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
 
+	// pendingKernelSync means service state (lastUsers, limiter, device
+	// limits, tombstones) has landed but the kernel may not reflect it
+	// yet: the kernel was stopped when the update arrived, a kernel
+	// user operation failed, or a rollback could not be confirmed in
+	// the kernel. Only a full kernel sync clears it — startKernel
+	// success, a successful UpdateUsers, or the trackAndEnforce
+	// reconciliation below. Partial operations (AddUsers/RemoveUsers)
+	// must NOT clear it, because they cannot remove a stale kernel
+	// entry left by an earlier failure. Main-loop goroutine only.
+	pendingKernelSync bool
+
 	// removedUserUUIDs remembers UUIDs of users removed from lastUsers, so
 	// trackAndEnforce can still kill their surviving connections (the
 	// kernel only knows a connection by UUID/email, and a removed user is
@@ -176,6 +187,15 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
+	// Device-limit rejections feed the limiter's device_limit_events
+	// counter (previously always zero: kernels had no callback to report
+	// rejections through). Both kernels expose the setter; sing-box
+	// re-applies it to each new tracker on Start, xray to each new
+	// dispatcher, so wiring once here covers restarts.
+	if setter, ok := k.(interface{ SetDeviceLimitRejectedFunc(func()) }); ok {
+		setter.SetDeviceLimitRejectedFunc(l.RecordDeviceLimitEvent)
+	}
+
 	return &Service{
 		cfg:    cfg,
 		source: cp,
@@ -274,6 +294,14 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	// NOTE (device_limit_events): the lookup above cannot observe the
+	// kernel's accept/reject decision, so rejected connections are not
+	// counted yet. The counting entry point is
+	// limiter.Limiter.RecordDeviceLimitEvent; the kernel side must call
+	// it from its device-gate rejection paths (see that method's doc
+	// for the exact call sites) once the Kernel interface gains a
+	// rejection callback. Until then limits.device_limit_events stays 0
+	// by construction, not by measurement.
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
 	if err != nil {
@@ -332,6 +360,11 @@ func (s *Service) initialSetup(ctx context.Context) error {
 
 	if len(bootstrap.Users) == 0 {
 		nlog.Core().Warn("no users, kernel will not start until users are available")
+		// Panel certificate settings must still be applied even with
+		// no users: otherwise a panel cert_config (or a legacy
+		// domain/auto_tls change) arriving with the first, empty
+		// snapshot is silently skipped until users appear.
+		s.applyRemoteOverrides(ctx, bootstrap.Config)
 		s.markMailboxReadyAndDrain(ctx)
 		return nil
 	}
@@ -362,13 +395,30 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) 
 		return s.applyNodeCert(ctx, nc.CertConfig)
 	}
 
-	// Legacy fields (deprecated: prefer cert_config)
-	if nc.AutoTLS != s.cfg.Cert.AutoTLS {
-		nlog.Core().Info("cert: auto_tls policy changed (deprecated field)", "new", nc.AutoTLS)
-		s.cfg.Cert.AutoTLS = nc.AutoTLS
-	}
-	if nc.Domain != "" && nc.Domain != s.cfg.Cert.Domain {
-		s.cfg.Cert.Domain = nc.Domain
+	// Legacy fields (deprecated: prefer cert_config). A change here must
+	// reach the cert manager via Reconfigure, not just mutate local
+	// config: otherwise the running ACME/file/self-signed setup keeps
+	// serving the old domain/policy until the next restart, while the
+	// panel already believes the new one applies. On Reconfigure
+	// failure the local config is left untouched (the manager itself
+	// restores its old state) and false is returned.
+	if nc.AutoTLS != s.cfg.Cert.AutoTLS || (nc.Domain != "" && nc.Domain != s.cfg.Cert.Domain) {
+		newCert := s.cfg.Cert
+		if nc.AutoTLS != s.cfg.Cert.AutoTLS {
+			nlog.Core().Info("cert: auto_tls policy changed (deprecated field)", "new", nc.AutoTLS)
+			newCert.AutoTLS = nc.AutoTLS
+		}
+		if nc.Domain != "" && nc.Domain != s.cfg.Cert.Domain {
+			nlog.Core().Info("cert: domain changed (deprecated field)", "new", nc.Domain)
+			newCert.Domain = nc.Domain
+		}
+		changed, err := s.cert.Reconfigure(ctx, newCert)
+		if err != nil {
+			nlog.Core().Error("failed to apply legacy cert fields", "error", err)
+			return false
+		}
+		s.cfg.Cert = newCert
+		return changed
 	}
 
 	return false
@@ -544,6 +594,23 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 			s.wsDisconnectAt = time.Time{}
 			s.metricsMu.Unlock()
 			s.startWSClient(ctx)
+		} else if !s.wsClient.IsConnected() {
+			// Discovery only runs after a >10min disconnect, so
+			// reaching here with a fresh client and a dead old one
+			// used to discard the new client and keep polling with
+			// the dead one. Cancel the old client and adopt the new
+			// one instead.
+			nlog.Core().Info("push discovery: replacing disconnected push client with newly discovered one")
+			if s.wsCancel != nil {
+				s.wsCancel()
+			}
+			s.metricsMu.Lock()
+			s.wsClient = pushClient
+			s.wsDisconnectAt = time.Time{}
+			s.metricsMu.Unlock()
+			s.startWSClient(ctx)
+		} else {
+			nlog.Core().Debug("push discovery: existing push client still connected, discarding discovered client")
 		}
 	} else if s.wsClient != nil {
 		nlog.Core().Info("push discovery: control plane disabled push, switching to polling")
@@ -761,6 +828,9 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
+	// A fresh kernel is built from the full current state, so any
+	// pending full sync is satisfied.
+	s.pendingKernelSync = false
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
@@ -771,7 +841,7 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 		s.nodeLog = nlog.ForNode(nc.Protocol, nc.ServerPort)
 	}
 	s.speedTracker.SetLogCallback(func(msg string) {
-		fullMsg := fmt.Sprintf("speedtracker: %s active_limiters=%d", msg, s.speedTracker.LimitedUserCount())
+		fullMsg := fmt.Sprintf("speedtracker: %s limited_users=%d", msg, s.speedTracker.LimitedUserCount())
 		s.nodeLog.Info(fullMsg)
 	})
 	s.nodeLog.Info(fmt.Sprintf("started, %d users", len(users)))
@@ -792,12 +862,12 @@ func (s *Service) ensureRunning() bool {
 
 // ─── User update entry points ───────────────────────────────────────────────
 
-// closeRemovedUsers terminates the live connections of users that are no
-// longer in the user set, and records their UUIDs for the trackAndEnforce
-// safety net. Removing a user from the kernel only blocks NEW connections;
-// without this step, existing connections of a removed (e.g. out-of-quota)
-// user would keep running indefinitely.
-func (s *Service) closeRemovedUsers(ctx context.Context, removed []model.UserSpec) {
+// recordRemovedUsers records tombstones for removed users so the
+// trackAndEnforce safety net can still kill their surviving connections.
+// It never touches the kernel, so it is safe (and required) even when
+// the kernel is stopped: a removal event must not be lost just because
+// there is no running kernel to close connections on yet.
+func (s *Service) recordRemovedUsers(removed []model.UserSpec) {
 	if len(removed) == 0 {
 		return
 	}
@@ -808,6 +878,20 @@ func (s *Service) closeRemovedUsers(ctx context.Context, removed []model.UserSpe
 		if u.UUID != "" {
 			s.removedUserUUIDs[u.ID] = u.UUID
 		}
+	}
+}
+
+// closeRemovedUsers terminates the live connections of users that are no
+// longer in the user set, and records their UUIDs for the trackAndEnforce
+// safety net. Removing a user from the kernel only blocks NEW connections;
+// without this step, existing connections of a removed (e.g. out-of-quota)
+// user would keep running indefinitely.
+func (s *Service) closeRemovedUsers(ctx context.Context, removed []model.UserSpec) {
+	if len(removed) == 0 {
+		return
+	}
+	s.recordRemovedUsers(removed)
+	for _, u := range removed {
 		if err := s.kernel.CloseUserConnections(ctx, u.UUID); err != nil {
 			nlog.Core().Warn(fmt.Sprintf("CloseUserConnections failed for user %d: %v", u.ID, err))
 		}
@@ -816,18 +900,43 @@ func (s *Service) closeRemovedUsers(ctx context.Context, removed []model.UserSpe
 
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
+//
+// Service state always lands first: a stopped kernel must not cause the
+// update to be dropped. If the kernel is stopped, the new state is kept,
+// tombstones for removed users are recorded, and either the kernel is
+// started from the new state right away (ensureRunning) or
+// pendingKernelSync is set so the next start / track-tick full sync
+// builds the kernel from the new state instead of the old one.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	prevUsers, prevHash := s.prepareUserState(users)
+	_, removedUsers := kernel.UserDiff(prevUsers, users)
+
+	if !s.kernel.IsRunning() {
+		s.recordRemovedUsers(removedUsers)
+		if s.ensureRunning() {
+			// Fresh kernel built from the already-landed new state.
+			if newHash != "" {
+				s.lastUserHash = newHash
+			}
+			return
+		}
+		s.pendingKernelSync = true
+		if newHash != "" {
+			s.lastUserHash = newHash
+		}
 		return
 	}
 
-	prevUsers, prevHash := s.prepareUserState(users)
-	_, removedUsers := kernel.UserDiff(prevUsers, users)
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
 		if !s.startKernel(s.lastConfig, users) {
 			s.restoreUserState(prevUsers, prevHash)
+			// Kernel state is now unknown (UpdateUsers failed and
+			// the restart failed): mark a full sync so the next
+			// track tick retries UpdateUsers with the restored set
+			// instead of assuming the kernel matches the service.
+			s.pendingKernelSync = true
 			return
 		}
 		// Kernel restarted with the new user set: the removed users are
@@ -836,6 +945,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		return
 	}
 	s.closeRemovedUsers(ctx, removedUsers)
+	s.pendingKernelSync = false
 	if newHash != "" {
 		s.lastUserHash = newHash
 	}
@@ -845,7 +955,13 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 }
 
 // applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API. Kernel updates run before updateUserState.
+// via the kernel's atomic user API.
+//
+// Like applyUserUpdate, service state always lands first: a stopped
+// kernel must not cause the delta to be dropped. If the kernel is
+// stopped, the new state (and, for removals, the tombstones) is kept,
+// and either the kernel is started from the new state right away or
+// pendingKernelSync is set for the next full sync.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
 	switch action {
 	case "add":
@@ -855,31 +971,79 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.ensureRunning() {
-			return
-		}
-
+		// UUID-change detection against the pre-delta set: a delta
+		// that reuses an ID with a new UUID must evict the old
+		// identity from the kernel, or the replaced user keeps
+		// using the old identity.
+		var uuidChangedOld []model.UserSpec
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
-					// The old UUID's connections must die too, or the
-					// replaced user keeps using the old identity.
-					s.closeRemovedUsers(ctx, []model.UserSpec{old})
+					uuidChangedOld = append(uuidChangedOld, old)
 					break
 				}
 			}
 		}
 
 		prevUsers, prevHash := s.prepareUserState(merged)
+		// Tombstones for the old identities land even if the kernel
+		// is stopped or the removal below fails.
+		s.recordRemovedUsers(uuidChangedOld)
+
+		if !s.kernel.IsRunning() {
+			if s.ensureRunning() {
+				// Fresh kernel built from the already-landed merged state.
+				return
+			}
+			s.pendingKernelSync = true
+			return
+		}
+
+		for _, old := range uuidChangedOld {
+			if _, err := s.kernel.RemoveUsers([]model.UserSpec{old}); err != nil {
+				// Never silently drop this: a failed removal leaves
+				// the old identity usable in the kernel while the
+				// service already serves the new one. Log it, kill
+				// the old identity's connections, and mark a full
+				// sync — the track tick's UpdateUsers(merged) is a
+				// full-set replace that evicts the stale entry.
+				nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed for replaced user %d (old UUID %s): %v", old.ID, old.UUID, err))
+				s.pendingKernelSync = true
+			}
+			// The old UUID's connections must die too, or the
+			// replaced user keeps using the old identity.
+			s.closeRemovedUsers(ctx, []model.UserSpec{old})
+		}
+
 		added, err := s.kernel.AddUsers(deltaUsers)
 		if err != nil {
 			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
 				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
+				// Dual failure: the kernel's user set is now
+				// unknown (AddUsers may have partially applied),
+				// so keeping the merged service state would let
+				// the service believe users exist that the kernel
+				// does not have. Chosen strategy: roll BOTH sides
+				// back to the pre-delta set — best-effort kernel
+				// restore via a full UpdateUsers(prevUsers), then
+				// service restore — and if the kernel restore also
+				// fails, mark pendingKernelSync so the next track
+				// tick retries a full UpdateUsers with the restored
+				// set. Connections of partially added users are
+				// closed, since from the service's view those users
+				// no longer exist.
+				if _, _, restoreErr := s.kernel.UpdateUsers(prevUsers); restoreErr != nil {
+					nlog.Core().Warn(fmt.Sprintf("kernel rollback to pre-delta users failed: %v, marking pending full sync", restoreErr))
+					s.pendingKernelSync = true
+				}
 				s.restoreUserState(prevUsers, prevHash)
+				s.closeRemovedUsers(ctx, usersNotInPrevPairs(prevUsers, merged))
 				return
 			}
+			// Full-set fallback succeeded: it reconciles any stale
+			// entry left by the failed old-UUID removal above.
+			s.pendingKernelSync = false
 		}
 		if s.nodeLog != nil && added > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))
@@ -892,20 +1056,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
 
-		if !s.kernel.IsRunning() {
-			return
-		}
-
 		prevUsers, prevHash := s.prepareUserState(filtered)
-		removed, err := s.kernel.RemoveUsers(deltaUsers)
-		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
-			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
-				return
-			}
-		}
 		// RemoveUsers only blocks new connections; kill the removed
 		// users' existing connections, in both the direct and fallback
 		// paths (filtered is the authoritative new set in both).
@@ -929,6 +1080,36 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			}
 			removedWithUUID = append(removedWithUUID, u)
 		}
+		// Tombstones land even when the kernel is stopped: a removal
+		// must never be lost because there was no running kernel.
+		s.recordRemovedUsers(removedWithUUID)
+
+		if !s.kernel.IsRunning() {
+			if s.ensureRunning() {
+				// Fresh kernel built from the already-landed filtered state.
+				return
+			}
+			s.pendingKernelSync = true
+			return
+		}
+
+		removed, err := s.kernel.RemoveUsers(deltaUsers)
+		if err != nil {
+			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
+			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
+				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
+				// Same dual-failure rule as the add path: try to
+				// roll the kernel back to the pre-delta set, and
+				// mark a pending full sync if that also fails.
+				if _, _, restoreErr := s.kernel.UpdateUsers(prevUsers); restoreErr != nil {
+					nlog.Core().Warn(fmt.Sprintf("kernel rollback to pre-delta users failed: %v, marking pending full sync", restoreErr))
+					s.pendingKernelSync = true
+				}
+				s.restoreUserState(prevUsers, prevHash)
+				return
+			}
+			s.pendingKernelSync = false
+		}
 		s.closeRemovedUsers(ctx, removedWithUUID)
 		if s.nodeLog != nil && removed > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
@@ -937,6 +1118,30 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 	default:
 		nlog.Core().Warn(fmt.Sprintf("unknown user delta action: %s", action))
 	}
+}
+
+// usersNotInPrevPairs returns the users in set whose (ID, UUID) pair does
+// not appear in base. Compared by pair, not ID alone, so a UUID-change
+// delta (same ID, new UUID) is included — its new identity must die on
+// rollback — while a re-sent unchanged user is not, so its legitimate
+// live connections are never closed by mistake.
+func usersNotInPrevPairs(base, set []model.UserSpec) []model.UserSpec {
+	inBase := make(map[int]map[string]struct{}, len(base))
+	for _, u := range base {
+		if inBase[u.ID] == nil {
+			inBase[u.ID] = make(map[string]struct{})
+		}
+		inBase[u.ID][u.UUID] = struct{}{}
+	}
+	var out []model.UserSpec
+	for _, u := range set {
+		if uuids, ok := inBase[u.ID]; !ok {
+			out = append(out, u)
+		} else if _, ok := uuids[u.UUID]; !ok {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // mergeUsers overlays deltaUsers onto base (keyed by ID). New users are
@@ -1010,6 +1215,9 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
 			s.appliedState.TLS = s.cert.TLSCert()
+			// Reload pushes the full config + user set, so any
+			// pending full sync is satisfied as well.
+			s.pendingKernelSync = false
 			if s.nodeLog != nil {
 				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 			}
@@ -1061,6 +1269,20 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 		return
 	}
 
+	// Reconcile a pending full sync: service state landed while the
+	// kernel was stopped or a kernel operation failed, so push the
+	// full current user set into the kernel now. A failed attempt
+	// keeps the flag, so the next track tick retries; it never
+	// blocks traffic reporting below.
+	if s.pendingKernelSync {
+		if _, _, err := s.kernel.UpdateUsers(s.lastUsers); err != nil {
+			nlog.Core().Debug("pending kernel sync failed, will retry on next track tick", "error", err)
+		} else {
+			s.pendingKernelSync = false
+			nlog.Core().Info("pending kernel sync reconciled")
+		}
+	}
+
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
@@ -1100,17 +1322,21 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 				nlog.Core().Warn(fmt.Sprintf("trackAndEnforce: CloseUserConnections failed for removed user %d: %v", uid, err))
 			}
 		}
-		// Prune tombstones for users with no alive IPs and no traffic left,
-		// so the map does not grow unboundedly with churned users.
-		for uid := range s.removedUserUUIDs {
-			if _, alive := aliveIPs[uid]; alive {
-				continue
-			}
-			if _, hasTraffic := traffic[uid]; hasTraffic {
-				continue
-			}
-			delete(s.removedUserUUIDs, uid)
+	}
+	// Prune tombstones for users with no alive IPs and no traffic left,
+	// so the map does not grow unboundedly with churned users. This
+	// must run unconditionally, not only when aliveIPs is non-empty:
+	// wrapped in the len(aliveIPs) > 0 guard above, a tick with zero
+	// online users never pruned anything, so tombstones accumulated
+	// forever exactly when nobody was online.
+	for uid := range s.removedUserUUIDs {
+		if _, alive := aliveIPs[uid]; alive {
+			continue
 		}
+		if _, hasTraffic := traffic[uid]; hasTraffic {
+			continue
+		}
+		delete(s.removedUserUUIDs, uid)
 	}
 
 	// Only log stats if there's actual traffic or connections
@@ -1292,6 +1518,37 @@ func computeUserHash(users []model.UserSpec) string {
 
 // ─── Device management ──────────────────────────────────────────────────
 
+// deviceReportSender is the WS device-report signature: failure returns
+// a non-nil error instead of being silently dropped. (The same applies
+// to SendDeviceReportForNode on the panel WSClient itself; the service
+// only ever reports for its own node, so it uses SendDeviceReport — the
+// machine layer tags node_id internally in its own push client.)
+type deviceReportSender interface {
+	SendDeviceReport(devices map[int][]string) error
+}
+
+// restoreDeviceSnapshot puts a flushed snapshot back into the tracker so
+// the next flush re-sends it (the same Restore pattern pushReportAsync
+// uses for REST reports).
+func (s *Service) restoreDeviceSnapshot(devices map[int][]string) {
+	if len(devices) > 0 {
+		s.tracker.RestoreAliveIPs(devices)
+	}
+}
+
+// sendDevicesVia sends one flushed snapshot through the new error-returning
+// sender. On failure the flushed data is restored into the tracker, so
+// the next flush re-sends it instead of losing the snapshot.
+func (s *Service) sendDevicesVia(sender deviceReportSender, devices map[int][]string) error {
+	if err := sender.SendDeviceReport(devices); err != nil {
+		nlog.Core().Warn("device snapshot send failed, restoring for retry", "error", err)
+		s.restoreDeviceSnapshot(devices)
+		return err
+	}
+	nlog.Core().Debug("device snapshot sent", "users", len(devices))
+	return nil
+}
+
 // sendDeviceBatch reports local device snapshot to panel via WS.
 func (s *Service) sendDeviceBatch() {
 	if s.wsClient == nil || !s.wsClient.IsConnected() {
@@ -1304,8 +1561,9 @@ func (s *Service) sendDeviceBatch() {
 		nlog.Core().Debug("device snapshot unchanged, skipping")
 		return
 	}
-	s.sink.ReportDevices(s.wsClient, devices)
-	nlog.Core().Debug("device snapshot sent", "users", len(devices))
+	// sendDevicesVia restores the snapshot into the tracker on failure,
+	// so the next flush re-sends it instead of losing the increment.
+	_ = s.sendDevicesVia(s.wsClient, devices)
 }
 
 // reportDevices periodically reports device snapshot to panel.
@@ -1338,6 +1596,14 @@ func validateTLSRequirements(spec *model.NodeSpec, tls kernel.TLSCert, kernelTyp
 		needsCert = true
 	case "trojan":
 		if spec.TLS != 2 {
+			needsCert = true
+		}
+	case "vless", "vmess":
+		// TLS == 1 is plain TLS (2 is Reality, which needs keys, not
+		// a certificate, and is validated separately below). Without
+		// this, a TLS-enabled vless/vmess node passed validation with
+		// no certificate anywhere and only failed at kernel start.
+		if spec.TLS == 1 {
 			needsCert = true
 		}
 	}

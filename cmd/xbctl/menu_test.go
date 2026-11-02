@@ -133,3 +133,35 @@ func TestSwitchKernelAt(t *testing.T) {
 		t.Fatal("invalid kernel should fail")
 	}
 }
+
+func TestMenuPauseEOFIsCleanExit(t *testing.T) {
+	// pauseForMenu returns io.EOF as its exit sentinel; runMenuLoop
+	// must convert it to a clean nil (exit 0), matching the
+	// option-read EOF path, instead of printing "EOF" and exiting 1.
+	// Input "6" runs status (no instances in test env: prints a
+	// notice, returns nil) and then hits EOF at the pause prompt.
+	var out bytes.Buffer
+	if err := runMenuLoop(bufio.NewReader(strings.NewReader("6\n")), &out); err != nil {
+		t.Fatalf("runMenuLoop after pause EOF should exit cleanly, got error: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "已退出菜单") {
+		t.Fatalf("expected clean exit line, got:\n%s", out.String())
+	}
+	// Direct pause check: the sentinel itself is still io.EOF.
+	var out2 bytes.Buffer
+	if err := pauseForMenu(bufio.NewReader(strings.NewReader("")), &out2); err == nil {
+		t.Fatal("pauseForMenu on EOF should return the EOF sentinel")
+	}
+}
+
+func TestMenuLogItemHonestCtrlCText(t *testing.T) {
+	var out bytes.Buffer
+	printMenu(&out)
+	text := out.String()
+	if strings.Contains(text, "按 Ctrl+C 回到菜单") {
+		t.Fatalf("log menu item still promises returning to the menu:\n%s", text)
+	}
+	if !strings.Contains(text, "按 Ctrl+C 退出") {
+		t.Fatalf("log menu item should state Ctrl+C exits:\n%s", text)
+	}
+}

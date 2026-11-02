@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -650,7 +650,22 @@ func (c *Config) AutoInstanceID() (string, error) {
 	baseURL := strings.TrimSpace(c.Panel.URL)
 	if c.IsStandalone() {
 		mode = "standalone"
-		target = "local"
+		// Standalone instances have no panel URL / node ID to anchor
+		// the ID to, so they are distinguished by their inbound
+		// identity (protocol + listen address + server port). Two
+		// standalone instances with the same inbound identity are
+		// treated as duplicates: they could not both bind the same
+		// listen address anyway, so a duplicate ID (rejected by
+		// validateRoot) is the correct outcome for them.
+		//
+		// ConfigDir is deliberately NOT used as the distinguisher:
+		// assignInstanceIDs runs before setDefaultsFrom fills in a
+		// default ConfigDir, so a ConfigDir-based ID would differ
+		// between a pre-defaults call (empty ConfigDir) and a
+		// post-defaults call (filled ConfigDir) for the same
+		// instance, and data directories derived from the ID would
+		// then disagree. The inbound identity is stable across both.
+		target = standaloneInstanceTarget(c.Standalone)
 		baseURL = "standalone"
 	} else if c.IsMachineMode() {
 		mode = "machine"
@@ -674,6 +689,47 @@ func (c *Config) AutoInstanceID() (string, error) {
 	sum := sha1.Sum([]byte(key))
 	short := hex.EncodeToString(sum[:])[:6]
 	return fmt.Sprintf("%s-%s-%s-%s", slug, mode, target, short), nil
+}
+
+// standaloneInstanceTarget derives the distinguishing part of a standalone
+// instance ID from its inbound identity. See AutoInstanceID for why
+// ConfigDir is not used here.
+func standaloneInstanceTarget(s *StandaloneConfig) string {
+	if s == nil {
+		return "local"
+	}
+	protocol := strings.ToLower(strings.TrimSpace(s.Node.Protocol))
+	if protocol == "" {
+		return "local"
+	}
+	target := "local-" + protocol
+	// Empty, "::" and "0.0.0.0" all mean "all interfaces" — they must map
+	// to the same target, otherwise two instances that would collide on
+	// the same wildcard bind would get different IDs.
+	listen := strings.TrimSpace(s.Node.ListenIP)
+	listen = strings.Trim(listen, "[]")
+	if listen != "" && listen != "::" && listen != "0.0.0.0" {
+		var b strings.Builder
+		lastDash := false
+		for _, r := range strings.ToLower(listen) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+				lastDash = false
+				continue
+			}
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+		if slug := strings.Trim(b.String(), "-"); slug != "" {
+			target += "-" + slug
+		}
+	}
+	if s.Node.ServerPort > 0 {
+		target += "-" + strconv.Itoa(s.Node.ServerPort)
+	}
+	return target
 }
 
 func normalizeBaseURL(raw string) (string, string, error) {
@@ -724,6 +780,38 @@ func normalizeBaseURL(raw string) (string, string, error) {
 	return normalized, slug, nil
 }
 
+// validNodeTypes is the set of node_type strings the panel can legitimately
+// send and this backend can serve. It is the union of the kernels' inbound
+// protocols (sing-box Protocols() lists exactly these twelve; xray serves
+// a subset, and a kernel mismatch for a type in this list is still caught
+// later by the kernel's own protocol check at service startup). Empty is
+// allowed: the panel client omits node_type from the request when it is
+// empty and the panel then resolves the type from node_id. Anything else —
+// including legacy aliases such as "v2ray" and "ss" — is rejected here so a
+// typo fails at config load instead of failing later against the panel.
+// Machine-discovered node types (ExpandMachineNode) are panel-supplied at
+// runtime and cannot be checked here; they go through the same kernel
+// protocol check at service startup.
+var validNodeTypes = []string{
+	"vless", "vmess", "trojan", "shadowsocks",
+	"hysteria", "hysteria2", "tuic", "anytls",
+	"naive", "socks", "http", "mieru",
+}
+
+func validateNodeType(field, value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	lower := strings.ToLower(trimmed)
+	for _, t := range validNodeTypes {
+		if lower == t {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s must be one of %s, got %q", field, strings.Join(validNodeTypes, ", "), value)
+}
+
 func (c *Config) validate() error {
 	if c.IsStandalone() {
 		if err := c.validateStandalone(); err != nil {
@@ -739,6 +827,13 @@ func (c *Config) validate() error {
 		if len(c.Nodes) > 0 {
 			return fmt.Errorf("machine mode and nodes: are mutually exclusive")
 		}
+		// A stale panel.node_type in machine mode is dead config (the
+		// type is discovered per node from the panel at runtime), but if
+		// it is set it must still be a legal type — a typo here should
+		// fail at config load, not be silently ignored.
+		if err := validateNodeType("panel.node_type", c.Panel.NodeType); err != nil {
+			return err
+		}
 	} else {
 		if c.Panel.URL == "" {
 			return fmt.Errorf("panel.url is required")
@@ -750,9 +845,15 @@ func (c *Config) validate() error {
 		if len(c.Nodes) == 0 && c.Panel.NodeID <= 0 {
 			return fmt.Errorf("panel.node_id must be positive (or use 'nodes:' for multi-node)")
 		}
+		if err := validateNodeType("panel.node_type", c.Panel.NodeType); err != nil {
+			return err
+		}
 		for i, n := range c.Nodes {
 			if n.NodeID <= 0 {
 				return fmt.Errorf("nodes[%d].node_id must be positive", i)
+			}
+			if err := validateNodeType(fmt.Sprintf("nodes[%d].node_type", i), n.NodeType); err != nil {
+				return err
 			}
 		}
 	}
@@ -783,6 +884,12 @@ func (c *Config) validate() error {
 	if c.WS.StatusInterval < 0 {
 		return fmt.Errorf("ws.status_interval must not be negative")
 	}
+	if c.WS.DiscoveryInterval < 0 {
+		return fmt.Errorf("ws.discovery_interval must not be negative")
+	}
+	if c.WS.HandshakeTimeout < 0 {
+		return fmt.Errorf("ws.handshake_timeout must not be negative")
+	}
 	if c.WS.BackoffInitial < 0 {
 		return fmt.Errorf("ws.backoff_initial must not be negative")
 	}
@@ -790,6 +897,58 @@ func (c *Config) validate() error {
 		return fmt.Errorf("ws.backoff_max must not be negative")
 	}
 	return nil
+}
+
+// mergeCertConfig overlays the non-zero fields of src onto dst. Bool
+// AutoTLS has no unset marker, so only an explicit true overrides: a
+// per-node cert block cannot turn global auto_tls off by writing false
+// (use cert_mode to choose a different cert strategy for that node).
+// DNSEnv is merged key by key, and dst's map is copied first so the
+// shared global map is never mutated through a derived node config.
+func mergeCertConfig(dst, src *CertConfig) {
+	if src.AutoTLS {
+		dst.AutoTLS = true
+	}
+	if src.Domain != "" {
+		dst.Domain = src.Domain
+	}
+	if src.Email != "" {
+		dst.Email = src.Email
+	}
+	if src.CertFile != "" {
+		dst.CertFile = src.CertFile
+	}
+	if src.KeyFile != "" {
+		dst.KeyFile = src.KeyFile
+	}
+	if src.CertDir != "" {
+		dst.CertDir = src.CertDir
+	}
+	if src.HTTPPort != 0 {
+		dst.HTTPPort = src.HTTPPort
+	}
+	if src.CertMode != "" {
+		dst.CertMode = src.CertMode
+	}
+	if src.DNSProvider != "" {
+		dst.DNSProvider = src.DNSProvider
+	}
+	if len(src.DNSEnv) > 0 {
+		merged := make(map[string]string, len(dst.DNSEnv)+len(src.DNSEnv))
+		for k, v := range dst.DNSEnv {
+			merged[k] = v
+		}
+		for k, v := range src.DNSEnv {
+			merged[k] = v
+		}
+		dst.DNSEnv = merged
+	}
+	if src.CertContent != "" {
+		dst.CertContent = src.CertContent
+	}
+	if src.KeyContent != "" {
+		dst.KeyContent = src.KeyContent
+	}
 }
 
 // ExpandNodes returns one *Config per node to run.
@@ -836,11 +995,26 @@ func (c *Config) ExpandNodes() []*Config {
 			}
 		}
 
-		// Per-node cert overrides
+		// Per-node cert overrides: merged field by field onto the
+		// global cert config (same design as KernelOverride), so a
+		// node that only sets e.g. domain keeps the global email,
+		// dns_provider, dns_env and the rest instead of losing them
+		// to a whole-struct replacement.
+		nodeCfg.Cert = c.Cert
 		if entry.Cert != nil {
-			nodeCfg.Cert = *entry.Cert
+			mergeCertConfig(&nodeCfg.Cert, entry.Cert)
 		}
-		if nodeCfg.Cert.CertDir == "" {
+		// Per-node CertDir isolation (mirrors ExpandMachineNode,
+		// which always derives node-%d/certs). This must NOT be
+		// gated on CertDir being empty: setDefaultsFrom has already
+		// filled the global CertDir with base/certs by the time
+		// ExpandNodes runs, so an "only when empty" branch never
+		// fires and every node silently shares base/certs. Instead,
+		// any node without an explicitly specified per-node CertDir
+		// is force-derived from its own (possibly per-node)
+		// ConfigDir; only an explicit per-node cert_dir is kept
+		// verbatim (the operator then owns any sharing it implies).
+		if entry.Cert == nil || strings.TrimSpace(entry.Cert.CertDir) == "" {
 			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
 		}
 
@@ -914,6 +1088,17 @@ func InitLogger(cfg LogConfig) {
 
 // ValidateStartupLayout checks that multiple instances do not conflict on
 // health ports, kernel config directories, or node bindings.
+//
+// Config directories are compared after expansion, not at the instance
+// level: comparing only instance.Kernel.ConfigDir both misses real
+// collisions (two instances whose expanded node dirs coincide even
+// though their instance dirs differ) and false-alarms (two instances
+// sharing one instance dir whose expanded node dirs are distinct, e.g.
+// base/node-1 vs base/node-2). Two expanded nodes sharing one directory
+// are a conflict even when they belong to the same instance, so unlike
+// the old instance-level check this one has no same-owner exemption.
+// Machine mode discovers nodes dynamically, so its expanded dirs are
+// unknown here and the instance-level dir is still checked for it.
 func ValidateStartupLayout(instances []*Config) error {
 	healthPorts := make(map[int]string)
 	configDirs := make(map[string]string)
@@ -929,15 +1114,16 @@ func ValidateStartupLayout(instances []*Config) error {
 			}
 			healthPorts[instance.HealthPort] = owner
 		}
-		if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
-			if other, ok := configDirs[dir]; ok && other != owner {
-				return fmt.Errorf("kernel config_dir %q is shared by %s and %s", dir, other, owner)
-			}
-			configDirs[dir] = owner
-		}
 		// Machine mode discovers nodes dynamically — skip static binding check,
 		// but still validate custom_config if set at the instance level.
 		if instance.IsMachineMode() {
+			if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
+				clean := filepath.Clean(dir)
+				if other, ok := configDirs[clean]; ok && other != owner {
+					return fmt.Errorf("kernel config_dir %q is shared by %s and %s", clean, other, owner)
+				}
+				configDirs[clean] = owner
+			}
 			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
 				if _, err := os.Stat(path); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
@@ -946,11 +1132,26 @@ func ValidateStartupLayout(instances []*Config) error {
 			continue
 		}
 		for _, node := range instance.ExpandNodes() {
-			binding := fmt.Sprintf("%s/%d", strings.TrimSpace(node.Panel.URL), node.Panel.NodeID)
-			if other, ok := nodeBindings[binding]; ok {
-				return fmt.Errorf("node binding %s is declared by both %s and %s", binding, other, owner)
+			label := fmt.Sprintf("%s (node %d)", owner, node.Panel.NodeID)
+			if dir := strings.TrimSpace(node.Kernel.ConfigDir); dir != "" {
+				clean := filepath.Clean(dir)
+				if other, ok := configDirs[clean]; ok {
+					return fmt.Errorf("kernel config_dir %q is shared by %s and %s", clean, other, label)
+				}
+				configDirs[clean] = label
 			}
-			nodeBindings[binding] = owner
+			// Standalone instances never contact a panel, so they
+			// have no panel binding to collide on (their URL is
+			// empty and node_id is 0, which would otherwise make
+			// every pair of standalone instances look like the
+			// same binding).
+			if !instance.IsStandalone() {
+				binding := fmt.Sprintf("%s/%d", normalizeBindingURL(node.Panel.URL), node.Panel.NodeID)
+				if other, ok := nodeBindings[binding]; ok {
+					return fmt.Errorf("node binding %s is declared by both %s and %s", binding, other, label)
+				}
+				nodeBindings[binding] = label
+			}
 			if path := strings.TrimSpace(node.Kernel.CustomConfig); path != "" {
 				if _, err := os.Stat(path); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
@@ -959,4 +1160,17 @@ func ValidateStartupLayout(instances []*Config) error {
 		}
 	}
 	return nil
+}
+
+// normalizeBindingURL canonicalises a panel URL for binding comparison:
+// trailing slashes are dropped and scheme/host are lowercased, so
+// "https://panel/" and "https://panel" (or "HTTPS://PANEL") compare equal.
+// The path itself keeps its case — URL paths are case-sensitive. An
+// unparsable URL falls back to a trimmed, lowercased string; validate()
+// has already rejected such URLs for panel instances by this point.
+func normalizeBindingURL(raw string) string {
+	if normalized, _, err := normalizeBaseURL(raw); err == nil {
+		return normalized
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "/"))
 }

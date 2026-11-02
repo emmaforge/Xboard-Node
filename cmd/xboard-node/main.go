@@ -161,13 +161,30 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 
+		warnFirstInstanceOnly(instances)
 		if instances[0].HealthPort != healthPort {
 			// startHealth binds first and only then closes the old
 			// listener, so a failed rebind keeps the old endpoint.
 			startHealth(instances[0].HealthPort)
 		}
 
-		errCh := make(chan error, len(instances))
+		// Buffer for one error per running service, not per instance:
+		// a single instance in multi-node mode runs len(nodes)
+		// services, and each failing service sends one error. Sizing
+		// by instance count deadlocked single-instance multi-node
+		// setups: the second failing node blocked on the send, its
+		// WaitGroup never finished, and the process never exited.
+		// Sends below are additionally non-blocking (first error
+		// wins; every error is already logged), so a future sender
+		// can never block shutdown even if the count is off.
+		totalServices := countServices(instances)
+		errCh := make(chan error, totalServices)
+		sendErr := func(err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}
 		doneCh := make(chan struct{})
 		var wg sync.WaitGroup
 		for _, instanceCfg := range instances {
@@ -183,7 +200,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 					orch := machine.New(instanceCfg)
 					if err := orch.Run(ctx); err != nil {
 						nlog.Core().Error("machine instance exited with error", "instance", instanceCfg.InstanceID, "error", err)
-						errCh <- err
+						sendErr(err)
 						cancel()
 					}
 					return
@@ -211,7 +228,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 						svc := service.New(nodeCfg)
 						if err := svc.Run(ctx); err != nil {
 							nlog.Core().Error("node service exited with error", "instance", nodeCfg.InstanceID, "node_id", nodeCfg.Panel.NodeID, "error", err)
-							errCh <- err
+							sendErr(err)
 							cancel()
 						}
 					}(idx)
@@ -226,7 +243,19 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		case newRoot = <-reloadCh:
 			nlog.Core().Info("config changed, restarting all services...")
 			cancel()
-			<-doneCh
+			// Bounded wait, same 15s ceiling as the signal path:
+			// an unbounded wait here could hang the reload forever
+			// if a service ignores cancellation, and a signal
+			// arriving mid-reload would otherwise force-exit the
+			// process while the replacement services are starting.
+			// On timeout the restart still proceeds; the old
+			// services' contexts are already cancelled, so they
+			// finish exiting on their own.
+			select {
+			case <-doneCh:
+			case <-time.After(15 * time.Second):
+				nlog.Core().Error("reload shutdown timed out after 15s, proceeding with restart; old services may still be stopping")
+			}
 		case <-doneCh:
 		}
 
@@ -253,6 +282,52 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
+	}
+}
+
+// countServices counts the services that will actually run: one per
+// machine-mode instance, one per node entry otherwise. It sizes the
+// error channel in runWithReload (see the comment there).
+func countServices(instances []*config.Config) int {
+	total := 0
+	for _, inst := range instances {
+		if inst.IsMachineMode() {
+			total++
+		} else {
+			total += len(inst.ExpandNodes())
+		}
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total
+}
+
+// warnFirstInstanceOnly logs an explicit warning for every later
+// instance whose health-port, log or runtime settings differ from the
+// first instance's. Only the first instance's values are ever used
+// (InitLogger, applyRuntimeConfig and startHealth all read
+// instances[0]); previously the others were silently ignored, so an
+// operator could believe a per-instance health port or log level was
+// in effect when it was not.
+func warnFirstInstanceOnly(instances []*config.Config) {
+	if len(instances) <= 1 {
+		return
+	}
+	first := instances[0]
+	for _, inst := range instances[1:] {
+		if inst.HealthPort != first.HealthPort {
+			nlog.Core().Warn("multi-instance: only the first instance's health_port takes effect; this instance's health_port is ignored",
+				"instance", inst.InstanceID, "health_port", inst.HealthPort, "effective_health_port", first.HealthPort)
+		}
+		if inst.Log != first.Log {
+			nlog.Core().Warn("multi-instance: only the first instance's log settings take effect; this instance's log settings are ignored",
+				"instance", inst.InstanceID, "log", inst.Log, "effective_log", first.Log)
+		}
+		if inst.Runtime != first.Runtime {
+			nlog.Core().Warn("multi-instance: only the first instance's runtime settings take effect; this instance's runtime settings are ignored",
+				"instance", inst.InstanceID, "runtime", inst.Runtime, "effective_runtime", first.Runtime)
+		}
 	}
 }
 

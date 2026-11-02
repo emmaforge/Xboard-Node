@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	"golang.org/x/time/rate"
 )
 
 func TestSpeedTracker_UpdateBuckets(t *testing.T) {
@@ -158,5 +159,156 @@ func TestBurstForUnifiedAcrossPaths(t *testing.T) {
 	}
 	if got := burstFor(20_000); got != 64*1024 {
 		t.Errorf("burstFor(20000) = %d, want 65536 floor", got)
+	}
+}
+
+// Item 10: the device-limit rejection counter moves only via the explicit
+// counting entry point (kernel gate-keeping must call it on rejection).
+func TestRecordDeviceLimitEvent(t *testing.T) {
+	l := New()
+	if got := l.SnapshotMetrics().DeviceLimitEvents; got != 0 {
+		t.Fatalf("initial DeviceLimitEvents = %d, want 0", got)
+	}
+	l.RecordDeviceLimitEvent()
+	l.RecordDeviceLimitEvent()
+	if got := l.SnapshotMetrics().DeviceLimitEvents; got != 2 {
+		t.Fatalf("DeviceLimitEvents = %d, want 2", got)
+	}
+}
+
+// Item 11: GetLimiter's double-check must re-verify the UUID mapping, not
+// just bucket existence. Here the UUID moved to another user while a
+// stale bucket for the old user ID still sits in the map: the lookup
+// must return a bucket for the NEW user, never the stale one.
+func TestSpeedTracker_GetLimiterDoubleCheckRemap(t *testing.T) {
+	l := New()
+	st := NewSpeedTracker(l)
+	l.UpdateUsers([]model.UserSpec{
+		{ID: 1, UUID: "u1", SpeedLimit: 3},
+		{ID: 2, UUID: "u2", SpeedLimit: 5},
+	})
+	st.UpdateBuckets()
+	oldBucket := st.GetLimiter("u1")
+	if oldBucket == nil {
+		t.Fatal("expected bucket for user 1")
+	}
+
+	// UUID u1 moves from user 1 to user 2 (UpdateBuckets rebuilds the
+	// mapping), but a stale bucket for user 1 lingers in the map.
+	l.UpdateUsers([]model.UserSpec{
+		{ID: 1, UUID: "uX", SpeedLimit: 3},
+		{ID: 2, UUID: "u1", SpeedLimit: 5},
+	})
+	st.UpdateBuckets()
+	st.mu.Lock()
+	st.buckets[1] = oldBucket
+	delete(st.buckets, 2)
+	st.mu.Unlock()
+
+	got := st.GetLimiter("u1")
+	if got == nil {
+		t.Fatal("expected bucket for remapped UUID u1")
+	}
+	if got == oldBucket {
+		t.Fatal("GetLimiter returned the stale bucket of the previous owner")
+	}
+	expectedRate := float64(5 * 1000000 / 8)
+	if float64(got.Limit()) != expectedRate {
+		t.Errorf("remapped bucket rate: got %v, want %v (user 2's limit)", float64(got.Limit()), expectedRate)
+	}
+}
+
+// Item 11 (stale config): a bucket whose user's limit was cancelled must
+// not be handed out at the old rate: after the cancel, the shared bucket
+// itself is retired to Inf, so any holder or fresh lookup observes
+// unlimited rather than the stale 3 Mbps rate.
+func TestSpeedTracker_GetLimiterDoubleCheckStaleLimit(t *testing.T) {
+	l := New()
+	st := NewSpeedTracker(l)
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 3}})
+	st.UpdateBuckets()
+	stale := st.GetLimiter("u1")
+	if stale == nil {
+		t.Fatal("expected bucket for user 1")
+	}
+
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 0}})
+	st.UpdateBuckets()
+	if stale.Limit() != rate.Inf {
+		t.Fatalf("retired bucket limit = %v, want +Inf", stale.Limit())
+	}
+	if got := st.GetLimiter("u1"); got != stale || got.Limit() != rate.Inf {
+		t.Fatal("expected fresh lookup to return the retired unlimited bucket")
+	}
+}
+
+// Item 12: LimitedUserCount counts CONFIGURED limits, not materialised
+// buckets — users that never opened a connection still count.
+func TestLimitedUserCountCountsConfiguredNotBuckets(t *testing.T) {
+	l := New()
+	st := NewSpeedTracker(l)
+	l.UpdateUsers([]model.UserSpec{
+		{ID: 1, UUID: "u1", SpeedLimit: 3},
+		{ID: 2, UUID: "u2", SpeedLimit: 5},
+		{ID: 3, UUID: "u3", SpeedLimit: 0},
+	})
+	if got := st.LimitedUserCount(); got != 2 {
+		t.Fatalf("LimitedUserCount = %d, want 2 (configured, no buckets yet)", got)
+	}
+	if !st.HasLimits() {
+		t.Fatal("HasLimits = false, want true with configured limits")
+	}
+	l.UpdateUsers([]model.UserSpec{
+		{ID: 1, UUID: "u1", SpeedLimit: 3},
+		{ID: 2, UUID: "u2", SpeedLimit: 0},
+		{ID: 3, UUID: "u3", SpeedLimit: 0},
+	})
+	if got := st.LimitedUserCount(); got != 1 {
+		t.Fatalf("LimitedUserCount = %d, want 1 after cancelling user 2's limit", got)
+	}
+}
+
+// Item 13: cancelling a limit retires the shared bucket in place, so a
+// connection that already holds the pointer stops being throttled at
+// once; re-imposing a limit re-arms the same pointer.
+func TestSpeedTracker_UpdateBucketsRetiresBucketOnLimitCancel(t *testing.T) {
+	l := New()
+	st := NewSpeedTracker(l)
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 3}})
+	st.UpdateBuckets()
+	held := st.GetLimiter("u1")
+	if held == nil {
+		t.Fatal("expected bucket for user 1")
+	}
+
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 0}})
+	st.UpdateBuckets()
+
+	if held.Limit() != rate.Inf {
+		t.Fatalf("held bucket limit = %v, want +Inf after limit cancel", held.Limit())
+	}
+	if got := st.GetLimiter("u1"); got != held {
+		t.Fatal("expected the same (retired) bucket to be returned while the user stays active")
+	}
+	if got := st.LimitedUserCount(); got != 0 {
+		t.Fatalf("LimitedUserCount = %d, want 0 after cancel", got)
+	}
+	if st.HasLimits() {
+		t.Fatal("HasLimits = true, want false after cancel")
+	}
+
+	// Re-impose: the same pointer is re-armed, so holders and new
+	// lookups alike see the new rate.
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 5}})
+	st.UpdateBuckets()
+	expectedRate := float64(5 * 1000000 / 8)
+	if float64(held.Limit()) != expectedRate {
+		t.Errorf("held bucket limit after re-impose = %v, want %v", float64(held.Limit()), expectedRate)
+	}
+	if got := st.GetLimiter("u1"); got != held {
+		t.Fatal("expected the same bucket pointer after re-impose")
+	}
+	if got := st.LimitedUserCount(); got != 1 {
+		t.Fatalf("LimitedUserCount = %d, want 1 after re-impose", got)
 	}
 }

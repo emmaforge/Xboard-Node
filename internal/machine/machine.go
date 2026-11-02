@@ -44,11 +44,13 @@ type Orchestrator struct {
 	statuses  map[int]chan<- controlplane.StatusChange
 
 	// Shared WS client (nil when WS is disabled or has never started).
-	ws       *panel.WSClient
-	wsCancel context.CancelFunc
-
-	// wsDisabled is set when the panel reports WS as disabled, so the
-	// Run loop does not keep retrying a handshake the panel refuses.
+	// ws, wsCancel and wsDisabled are guarded by wsMu: startNode reads
+	// ws while tryStartWS (Run loop / WS-retry ticker) writes it, and
+	// stopAll reads wsCancel while tryStartWS writes it. Reading them
+	// without the mutex was a data race.
+	wsMu       sync.RWMutex
+	ws         *panel.WSClient
+	wsCancel   context.CancelFunc
 	wsDisabled bool
 
 	// runCtx is stored from Run() so that onWSEvent can trigger rediscover
@@ -58,6 +60,48 @@ type Orchestrator struct {
 	pullInterval time.Duration
 	pushInterval time.Duration
 }
+
+// wsClient returns the shared WS client under wsMu (may be nil).
+func (o *Orchestrator) wsClient() *panel.WSClient {
+	o.wsMu.RLock()
+	defer o.wsMu.RUnlock()
+	return o.ws
+}
+
+// wsDisabledFlag reports whether the panel disabled WS, under wsMu.
+func (o *Orchestrator) wsDisabledFlag() bool {
+	o.wsMu.RLock()
+	defer o.wsMu.RUnlock()
+	return o.wsDisabled
+}
+
+// setWSClient stores the shared WS client and its cancel func under wsMu.
+func (o *Orchestrator) setWSClient(ws *panel.WSClient, cancel context.CancelFunc) {
+	o.wsMu.Lock()
+	o.ws = ws
+	o.wsCancel = cancel
+	o.wsMu.Unlock()
+}
+
+// setWSDisabled marks WS as panel-disabled under wsMu.
+func (o *Orchestrator) setWSDisabled() {
+	o.wsMu.Lock()
+	o.wsDisabled = true
+	o.wsMu.Unlock()
+}
+
+// wsCancelFunc returns the shared WS cancel func under wsMu (may be nil).
+func (o *Orchestrator) wsCancelFunc() context.CancelFunc {
+	o.wsMu.RLock()
+	defer o.wsMu.RUnlock()
+	return o.wsCancel
+}
+
+// nodeRestartBackoff is the delay before an unexpectedly-exited node is
+// restarted (see startNode). It keeps a crash-looping node from being
+// relaunched in a tight loop; the rediscover ticker can still relaunch
+// it sooner, in which case the backoff restart is a no-op.
+const nodeRestartBackoff = 5 * time.Second
 
 // New creates a machine orchestrator from the given config.
 func New(cfg *config.Config) *Orchestrator {
@@ -120,9 +164,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			o.reportMachineStatus()
 
 		case <-wsRetryTicker.C:
-			if o.ws == nil && !o.wsDisabled {
+			if o.wsClient() == nil && !o.wsDisabledFlag() {
 				o.tryStartWS(ctx)
-				if o.ws != nil || o.wsDisabled {
+				if o.wsClient() != nil || o.wsDisabledFlag() {
 					wsRetryTicker.Stop()
 				}
 			}
@@ -142,7 +186,8 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	nodeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	handle := &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	o.nodes[mn.ID] = handle
 	o.mu.Unlock()
 
 	o.eventsMu.Lock()
@@ -156,21 +201,30 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	// Pre-fetch node config to detect transport-based kernel requirements.
 	// If the transport (e.g. xhttp) is incompatible with the configured kernel
 	// (e.g. singbox), auto-switch to the required kernel for this node.
-	if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
-		if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
-			nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
-				mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
-			nodeCfg.Kernel.Type = resolved
-		}
+	// A prefetch failure used to be swallowed silently (empty err branch),
+	// so a node could start on the wrong kernel with no trace. Now it is
+	// logged, and the kernel choice is re-checked by the service's
+	// Initial() fetch (the ETag reset below forces a full response there),
+	// so a transient prefetch failure only loses the early auto-switch.
+	if cfgSnapshot, err := perNodeClient.GetConfig(); err != nil {
+		nlog.Core().Warn("machine: prefetch node config failed, kernel auto-switch skipped; service Initial will retry",
+			"node_id", mn.ID, "error", err)
+	} else if cfgSnapshot == nil {
+		nlog.Core().Warn("machine: prefetch node config returned empty snapshot, kernel auto-switch skipped",
+			"node_id", mn.ID)
+	} else if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
+		nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
+			mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
+		nodeCfg.Kernel.Type = resolved
 	}
 	// Reset cached ETag so the subsequent GetConfig in Initial() gets a full response.
 	perNodeClient.ResetConfigETag()
 
 	var push controlplane.PushClient
-	if o.ws != nil {
+	if ws := o.wsClient(); ws != nil {
 		push = &machineNodePush{
 			nodeID: mn.ID,
-			ws:     o.ws,
+			ws:     ws,
 		}
 	}
 
@@ -190,12 +244,54 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 
 	go func() {
 		defer close(done)
-		defer o.unregisterNode(mn.ID)
+		defer o.unregisterNode(mn.ID, mb)
+		// Detach this handle on exit and, for an unexpected exit only,
+		// schedule a backoff restart. Previously the exit path only
+		// unregistered the mailbox and left the o.nodes handle in
+		// place, so startNode/rediscover saw the dead node as still
+		// running and it was never relaunched. This defer runs before
+		// close(done) (LIFO), so stopNode's <-done wait is unaffected.
+		// No restart when stopNode already detached the handle (a
+		// deliberate stop) or when the parent context is done (process
+		// shutdown / reload), which keeps stop semantics intact.
+		defer func() {
+			if !o.removeNodeHandle(mn.ID, handle) {
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			nlog.Core().Warn("machine: node exited unexpectedly, scheduling restart",
+				"node_id", mn.ID, "backoff", nodeRestartBackoff)
+			go func() {
+				timer := time.NewTimer(nodeRestartBackoff)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+					o.startNode(ctx, mn)
+				}
+			}()
+		}()
 		if err := svc.Run(nodeCtx); err != nil {
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
 		}
 	}()
+}
+
+// removeNodeHandle deletes the o.nodes entry for nodeID, but only if it
+// is still this handle (pointer comparison). A stopNode-detached entry
+// or a replacement node's handle must never be removed by a stale exit.
+func (o *Orchestrator) removeNodeHandle(nodeID int, handle *nodeHandle) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if cur, ok := o.nodes[nodeID]; ok && cur == handle {
+		delete(o.nodes, nodeID)
+		return true
+	}
+	return false
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
@@ -210,6 +306,10 @@ func (o *Orchestrator) stopNode(nodeID int) {
 
 	o.eventsMu.Lock()
 	delete(o.mailboxes, nodeID)
+	// Statuses are deleted here too, synchronously, because the
+	// exiting goroutine must not delete them (see unregisterNode:
+	// it cannot prove ownership of the channel entry).
+	delete(o.statuses, nodeID)
 	o.eventsMu.Unlock()
 
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
@@ -233,8 +333,8 @@ func (o *Orchestrator) stopAll() {
 		<-h.done
 	}
 
-	if o.wsCancel != nil {
-		o.wsCancel()
+	if wsCancel := o.wsCancelFunc(); wsCancel != nil {
+		wsCancel()
 	}
 }
 
@@ -300,7 +400,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	}
 	if !hs.WebSocket.Enabled || hs.WebSocket.WSURL == "" {
 		nlog.Core().Info("machine: ws disabled by panel, REST only")
-		o.wsDisabled = true
+		o.setWSDisabled()
 		return
 	}
 
@@ -312,7 +412,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		MachineID:        o.cfg.Machine.MachineID,
 	}
 
-	o.ws = panel.NewWSClient(
+	ws := panel.NewWSClient(
 		hs.WebSocket.WSURL,
 		o.cfg.Machine.Token,
 		0, // no single node_id
@@ -323,8 +423,8 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	)
 
 	wsCtx, wsCancel := context.WithCancel(ctx)
-	o.wsCancel = wsCancel
-	go o.ws.Run(wsCtx)
+	o.setWSClient(ws, wsCancel)
+	go ws.Run(wsCtx)
 
 	nlog.Core().Info("machine: ws mux started")
 }
@@ -381,11 +481,28 @@ func (o *Orchestrator) registerNode(nodeID int, st chan<- controlplane.StatusCha
 	o.eventsMu.Unlock()
 }
 
-func (o *Orchestrator) unregisterNode(nodeID int) {
+// unregisterNode removes this node's mailbox, but only when it is
+// still this node's own (pointer comparison). Previously it deleted
+// unconditionally, so a stale exit running after stopNode + startNode
+// of a replacement node deleted the new node's mailbox.
+// The status channel is deliberately NOT deleted here: the exiting
+// goroutine never saw its own channel (registration happens inside
+// the service), so it cannot prove ownership of the map entry —
+// comparing against the current handle's channel would be exactly
+// the stale-delete bug again, because a replacement node's channel
+// matches its own handle. Status cleanup belongs to stopNode (which
+// deletes it synchronously before cancelling) and to registration
+// itself (a restarted node overwrites the entry); a leftover entry
+// for a dead service is harmless because onWSStatus sends to it
+// non-blockingly and it is overwritten or removed on the next
+// stop/start. The mailbox, by contrast, must be removed: events
+// routed to a dead mailbox would otherwise accumulate unseen.
+func (o *Orchestrator) unregisterNode(nodeID int, mb *controlplane.NodeMailbox) {
 	o.eventsMu.Lock()
-	delete(o.mailboxes, nodeID)
-	delete(o.statuses, nodeID)
-	o.eventsMu.Unlock()
+	defer o.eventsMu.Unlock()
+	if cur, ok := o.mailboxes[nodeID]; ok && cur == mb {
+		delete(o.mailboxes, nodeID)
+	}
 }
 
 // applyIntervals adopts the panel's base intervals, clamped UP to the
@@ -427,9 +544,9 @@ func (p *machineNodePush) IsConnected() bool {
 	return p.ws != nil && p.ws.IsConnected()
 }
 
-func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
+func (p *machineNodePush) SendDeviceReport(devices map[int][]string) error {
 	if p.ws == nil {
-		return
+		return fmt.Errorf("machine node push client: ws not connected")
 	}
 	payload := map[string]interface{}{
 		"node_id": p.nodeID,
@@ -442,4 +559,5 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	payload["devices"] = strDevices
 	data, _ := json.Marshal(payload)
 	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	return nil
 }

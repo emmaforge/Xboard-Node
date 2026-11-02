@@ -74,7 +74,7 @@ func printMenu(out io.Writer) {
 	fmt.Fprintln(out, "  5. 重启服务            重启 xboard-node systemd 服务（需确认）")
 	fmt.Fprintln(out, "  6. 查看服务状态        服务、健康检查与实例一览")
 	fmt.Fprintln(out, "  7. 查看实例列表        列出已绑定的节点/机器实例")
-	fmt.Fprintln(out, "  8. 查看实时日志        跟随输出服务日志，按 Ctrl+C 回到菜单")
+	fmt.Fprintln(out, "  8. 查看实时日志        跟随输出服务日志，按 Ctrl+C 退出（将结束菜单程序）")
 	fmt.Fprintln(out, "  9. 查看版本            显示 xbctl 版本")
 	fmt.Fprintln(out, "  10. 切换内核           在 sing-box 与 xray 之间切换（需确认并重启）")
 	fmt.Fprintln(out, "  11. 更新到最新版       从发布页下载最新版并替换二进制（需确认）")
@@ -149,7 +149,11 @@ func runMenuLoop(in *bufio.Reader, out io.Writer) error {
 				fmt.Fprintf(out, "操作失败：%v\n", err)
 			}
 		case "8":
-			fmt.Fprintln(out, "正在跟随服务日志，按 Ctrl+C 回到菜单……")
+			// Honest wording: this process installs no SIGINT
+			// handler, so Ctrl+C kills xbctl itself instead of
+			// returning to the menu. The old "回到菜单" text
+			// promised behaviour the program never had.
+			fmt.Fprintln(out, "正在跟随服务日志，按 Ctrl+C 退出日志查看（将结束菜单程序）……")
 			if err := runService([]string{"logs"}); err != nil {
 				fmt.Fprintf(out, "查看日志结束：%v\n", err)
 			}
@@ -178,6 +182,14 @@ func runMenuLoop(in *bufio.Reader, out io.Writer) error {
 			continue
 		}
 		if err := pauseForMenu(in, out); err != nil {
+			// pauseForMenu uses io.EOF as its "exit the menu"
+			// sentinel (EOF on stdin, or q at the pause prompt).
+			// Treat it as a clean exit, like the option-read EOF
+			// path above: returning it would print "EOF" on
+			// stderr and exit 1, while the option path exits 0.
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			return err
 		}
 	}

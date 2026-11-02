@@ -50,28 +50,29 @@ type instanceRow struct {
 }
 
 type fileRootConfig struct {
-	Log       *fileLogConfig     `yaml:"log,omitempty"`
-	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
-	Node      *fileNodeConfig    `yaml:"node,omitempty"`
-	WS        *config.WSConfig   `yaml:"ws,omitempty"`
-	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance      `yaml:"instances,omitempty"`
+	Log        *fileLogConfig     `yaml:"log,omitempty"`
+	Kernel     *fileKernelConfig  `yaml:"kernel,omitempty"`
+	Node       *fileNodeConfig    `yaml:"node,omitempty"`
+	WS         *config.WSConfig   `yaml:"ws,omitempty"`
+	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
+	Cert       *config.CertConfig `yaml:"cert,omitempty"`
+	HealthPort int                `yaml:"health_port,omitempty"`
+	Instances  []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
-	ID         string             `yaml:"id,omitempty"`
-	Panel      filePanelConfig    `yaml:"panel"`
-	Node       *fileNodeConfig    `yaml:"node,omitempty"`
-	Kernel     fileKernelConfig   `yaml:"kernel"`
-	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	HealthPort int                `yaml:"health_port,omitempty"`
-	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
-	Standalone map[string]any     `yaml:"standalone,omitempty"`
-	Cert       *config.CertConfig `yaml:"cert,omitempty"`
-	WS         *config.WSConfig   `yaml:"ws,omitempty"`
-	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+	ID         string                   `yaml:"id,omitempty"`
+	Panel      filePanelConfig          `yaml:"panel"`
+	Node       *fileNodeConfig          `yaml:"node,omitempty"`
+	Kernel     fileKernelConfig         `yaml:"kernel"`
+	Log        fileLogConfig            `yaml:"log"`
+	Runtime    *fileRuntimeConfig       `yaml:"runtime,omitempty"`
+	HealthPort int                      `yaml:"health_port,omitempty"`
+	Machine    *fileMachineConfig       `yaml:"machine,omitempty"`
+	Standalone *config.StandaloneConfig `yaml:"standalone,omitempty"`
+	Cert       *config.CertConfig       `yaml:"cert,omitempty"`
+	WS         *config.WSConfig         `yaml:"ws,omitempty"`
+	Nodes      []config.NodeEntry       `yaml:"nodes,omitempty"`
 }
 
 type filePanelConfig struct {
@@ -366,7 +367,88 @@ func runBind(args []string) error {
 	}
 }
 
+// validateBindArgs checks a bind's arguments before anything is
+// written or restarted, so a missing/illegal value fails loudly here
+// instead of printing "Binding added successfully" afterwards. It
+// validates: token non-empty, mode node/machine, kernel singbox/xray
+// when given, and the required ID for the mode. Panel URL presence is
+// also checked here (runConfigInit re-checks it as well).
+func validateBindArgs(mode string, args []string) error {
+	if mode != "node" && mode != "machine" {
+		return fmt.Errorf("invalid bind mode: %s (want node or machine)", mode)
+	}
+	var token, panelURL, kernel string
+	var nodeID, machineID int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--panel-url":
+			if i+1 >= len(args) {
+				return errors.New("missing value for --panel-url")
+			}
+			panelURL = args[i+1]
+			i++
+		case "--token":
+			if i+1 >= len(args) {
+				return errors.New("missing value for --token")
+			}
+			token = args[i+1]
+			i++
+		case "--node-id":
+			if i+1 >= len(args) {
+				return errors.New("missing value for --node-id")
+			}
+			v, err := parsePositiveInt(args[i+1], "node-id")
+			if err != nil {
+				return err
+			}
+			nodeID = v
+			i++
+		case "--machine-id":
+			if i+1 >= len(args) {
+				return errors.New("missing value for --machine-id")
+			}
+			v, err := parsePositiveInt(args[i+1], "machine-id")
+			if err != nil {
+				return err
+			}
+			machineID = v
+			i++
+		case "--node-type", "--kernel", "--health-port", "--gomemlimit", "--gogc":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %s", args[i])
+			}
+			if args[i] == "--kernel" {
+				kernel = args[i+1]
+			}
+			i++
+		default:
+			return fmt.Errorf("unknown bind flag: %s", args[i])
+		}
+	}
+	if strings.TrimSpace(panelURL) == "" {
+		return errors.New("bind requires --panel-url")
+	}
+	if strings.TrimSpace(token) == "" {
+		return errors.New("bind requires --token (panel/machine key must not be empty)")
+	}
+	if kernel != "" {
+		if _, err := normalizeKernel(kernel); err != nil {
+			return fmt.Errorf("invalid --kernel: %w", err)
+		}
+	}
+	if mode == "node" && nodeID <= 0 {
+		return errors.New("bind requires --node-id for node mode")
+	}
+	if mode == "machine" && machineID <= 0 {
+		return errors.New("bind requires --machine-id for machine mode")
+	}
+	return nil
+}
+
 func runBindAdd(mode string, args []string) error {
+	if err := validateBindArgs(mode, args); err != nil {
+		return fmt.Errorf("bind failed: %w", err)
+	}
 	// Build configInit args from bind args
 	initArgs := []string{
 		"--mode", mode,
@@ -417,16 +499,32 @@ func runUpgrade(args []string) error {
 	newBinary := filepath.Join(binaryDir, ".xboard-node.new")
 	newCLI := filepath.Join(cliDir, ".xbctl.new")
 
-	binaryURL := resolveDownloadURL(fmt.Sprintf("xboard-node-linux-%s", arch), version)
-	cliURL := resolveDownloadURL(fmt.Sprintf("xbctl-linux-%s", arch), version)
+	// Download with the same latest → dev fallback as install.sh's
+	// download_artifact: only a 404 on the latest release falls back
+	// to the dev release; a network failure is reported as-is instead
+	// of silently installing dev.
+	downloadUpgradeArtifact := func(artifact, dest string) error {
+		url := resolveDownloadURL(artifact, version)
+		fmt.Printf("Downloading %s...\n", url)
+		if err := downloadFileWithChecksum(url, dest); err == nil {
+			return nil
+		} else if version == "latest" && downloadHTTPStatus(err) == 404 {
+			devURL := resolveDownloadURL(artifact, "dev")
+			fmt.Printf("Latest release not found (404), falling back to dev release: %s\n", devURL)
+			if err := downloadFileWithChecksum(devURL, dest); err != nil {
+				return fmt.Errorf("download %s from dev release: %w", artifact, err)
+			}
+			return nil
+		} else {
+			return err
+		}
+	}
 
-	fmt.Printf("Downloading %s...\n", binaryURL)
-	if err := downloadFileWithChecksum(binaryURL, newBinary); err != nil {
+	if err := downloadUpgradeArtifact(fmt.Sprintf("xboard-node-linux-%s", arch), newBinary); err != nil {
 		return fmt.Errorf("download binary: %w", err)
 	}
 
-	fmt.Printf("Downloading %s...\n", cliURL)
-	if err := downloadFileWithChecksum(cliURL, newCLI); err != nil {
+	if err := downloadUpgradeArtifact(fmt.Sprintf("xbctl-linux-%s", arch), newCLI); err != nil {
 		os.Remove(newBinary)
 		return fmt.Errorf("download xbctl: %w", err)
 	}
@@ -556,6 +654,13 @@ func runUninstall(args []string) error {
 		if err := runCommand("systemctl", "stop", serviceName); err != nil {
 			warnings = append(warnings, fmt.Sprintf("stop service: %v", err))
 		}
+		// Verify the service really stopped before deleting any
+		// binary: a stop that reported success (or a stop error
+		// swallowed into warnings) must not lead to binaries being
+		// removed from under a still-running service.
+		if systemctlState() == "active" {
+			return fmt.Errorf("uninstall aborted: service %s is still active after stop; binaries not removed", serviceName)
+		}
 		if err := runCommand("systemctl", "disable", serviceName); err != nil {
 			warnings = append(warnings, fmt.Sprintf("disable service: %v", err))
 		}
@@ -608,6 +713,22 @@ func resolveDownloadURL(artifact, version string) string {
 		return downloadBase + "/latest/download/" + artifact
 	}
 	return downloadBase + "/download/" + version + "/" + artifact
+}
+
+// downloadHTTPStatus extracts the HTTP status code from a downloadFile
+// error ("HTTP <code> from <url>"), or 0 when the error is not an HTTP
+// error (e.g. a network failure). It is what lets the upgrade fallback
+// distinguish a missing latest release (404 → try dev) from a network
+// outage (no fallback, report the failure).
+func downloadHTTPStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	var status int
+	if _, scanErr := fmt.Sscanf(err.Error(), "HTTP %d", &status); scanErr != nil {
+		return 0
+	}
+	return status
 }
 
 func downloadFile(url, dest string) error {
@@ -781,8 +902,10 @@ func parseRemoveMachineArgs(args []string) (string, int, error) {
 }
 
 func parsePositiveInt(raw string, field string) (int, error) {
-	var value int
-	_, err := fmt.Sscanf(raw, "%d", &value)
+	// Strict whole-string parse, same rule as parseMemLimit (B15 in
+	// cmd/xboard-node): fmt.Sscanf("%d") used to accept "12abc" as 12
+	// and "1.5" as 1, silently using the wrong ID.
+	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("invalid %s: %s", field, raw)
 	}
@@ -832,15 +955,27 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
 	}
 	if len(kept) == 0 {
-		// Last binding removed — stop the service to prevent crash-loop
-		root.Instances = nil
-		if err := writeRootConfig(defaultConfigPath, root); err != nil {
+		// Last binding removed — stop the service to prevent crash-loop.
+		// The written config must genuinely contain no binding:
+		// writeRootConfig normally resurrects a legacy single config
+		// from root.Config.Panel, so a copy with the legacy binding
+		// fields cleared is written instead (top-level shared settings
+		// such as log/kernel are preserved; only the binding is gone).
+		// Previously the legacy config was written straight back, so
+		// removing the last binding silently kept it.
+		lastRoot := *root
+		lastRoot.Instances = nil
+		lastRoot.Config.Panel = config.PanelConfig{}
+		lastRoot.Config.Machine = nil
+		lastRoot.Config.Nodes = nil
+		lastRoot.Config.Standalone = nil
+		if err := writeRootConfig(defaultConfigPath, &lastRoot); err != nil {
 			return err
 		}
 		if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
 			return err
 		}
-		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
+		if err := writeInstallMeta(defaultMetaPath, &lastRoot); err != nil {
 			return err
 		}
 		runCommand("systemctl", "stop", serviceName)
@@ -898,6 +1033,31 @@ func normalizeRootInstances(root *config.RootConfig) []config.Config {
 	return nil
 }
 
+// certNonEmpty reports whether any cert field is set. The old write
+// gate only looked at mode/domain/cert_file/auto_tls, so a cert block
+// carrying only an email, DNS provider, http_port, cert_dir or inline
+// content was dropped on every rewrite.
+func certNonEmpty(c config.CertConfig) bool {
+	return c.AutoTLS || c.Domain != "" || c.Email != "" || c.CertFile != "" ||
+		c.KeyFile != "" || c.CertDir != "" || c.HTTPPort != 0 ||
+		c.CertMode != "" || c.DNSProvider != "" || len(c.DNSEnv) > 0 ||
+		c.CertContent != "" || c.KeyContent != ""
+}
+
+// wsNonEmpty reports whether any WS tuning field is set. The old write
+// gate missed backoff_max and discovery_interval, dropping them.
+func wsNonEmpty(w config.WSConfig) bool {
+	return w.StatusInterval != 0 || w.HandshakeTimeout != 0 ||
+		w.BackoffInitial != 0 || w.BackoffMax != 0 || w.DiscoveryInterval != 0
+}
+
+// kernelNonEmpty reports whether any top-level kernel field is set.
+func kernelNonEmpty(k config.KernelConfig) bool {
+	return k.Type != "" || k.ConfigDir != "" || k.LogLevel != "" ||
+		k.GeoDataDir != "" || k.CustomConfig != "" ||
+		len(k.CustomRoute) > 0 || len(k.CustomOutbound) > 0
+}
+
 func writeRootConfig(path string, root *config.RootConfig) error {
 	instances := root.Instances
 	if len(instances) == 0 && root.Config.Panel.URL != "" {
@@ -910,8 +1070,19 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if kernelNonEmpty(p.Kernel) {
+		// Write the full kernel block, not just type/log_level:
+		// custom_config (and geo_data_dir / custom_route /
+		// custom_outbound / config_dir) used to be dropped here.
+		out.Kernel = &fileKernelConfig{
+			Type:         p.Kernel.Type,
+			ConfigDir:    p.Kernel.ConfigDir,
+			LogLevel:     p.Kernel.LogLevel,
+			GeoDataDir:   p.Kernel.GeoDataDir,
+			CustomConfig: p.Kernel.CustomConfig,
+			CustomRoute:  p.Kernel.CustomRoute,
+			CustomOut:    p.Kernel.CustomOutbound,
+		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -924,12 +1095,15 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
 		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
 	}
-	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
-		out.WS = &p.WS
+	if wsNonEmpty(p.WS) {
+		wsCopy := p.WS
+		out.WS = &wsCopy
 	}
-	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
-		out.Cert = &p.Cert
+	if certNonEmpty(p.Cert) {
+		certCopy := p.Cert
+		out.Cert = &certCopy
 	}
+	out.HealthPort = p.HealthPort
 
 	for _, inst := range instances {
 		fi := fileInstance{
@@ -977,11 +1151,21 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			fi.Panel.NodeID = 0
 			fi.Panel.NodeType = ""
 		}
-		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
-			fi.Cert = &inst.Cert
+		// Standalone round-trips verbatim: the field used to be
+		// declared but never assigned here, so every rewrite silently
+		// turned a standalone instance back into a panel instance.
+		fi.Standalone = inst.Standalone
+		// The instance cert block is written in full whenever any
+		// cert field is set — not only when mode/domain/file/
+		// auto_tls is set — so email, DNS provider/env, http_port,
+		// cert_dir and inline content survive a rewrite.
+		if certNonEmpty(inst.Cert) {
+			certCopy := inst.Cert
+			fi.Cert = &certCopy
 		}
-		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
-			fi.WS = &inst.WS
+		if wsNonEmpty(inst.WS) {
+			wsCopy := inst.WS
+			fi.WS = &wsCopy
 		}
 		if len(inst.Nodes) > 0 {
 			fi.Nodes = inst.Nodes
@@ -1052,12 +1236,26 @@ func instanceMode(inst config.Config) string {
 	return "node"
 }
 
+// collectInstanceRows reads the instance list from the config file
+// first and only falls back to install-meta.json when the config is
+// unreadable or empty. The config file is the source of truth: the old
+// meta-first order showed stale bindings (e.g. after a manual config
+// edit or a failed bind) until the meta file happened to be rewritten.
+// Meta remains a fallback for installs whose config cannot be parsed,
+// not a preferred source.
 func collectInstanceRows() ([]instanceRow, error) {
-	rows, err := collectRowsFromMeta()
+	rows, err := collectRowsFromConfig()
 	if err == nil && len(rows) > 0 {
 		return rows, nil
 	}
-	return collectRowsFromConfig()
+	metaRows, metaErr := collectRowsFromMeta()
+	if metaErr == nil && len(metaRows) > 0 {
+		return metaRows, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, metaErr
 }
 
 func collectRowsFromMeta() ([]instanceRow, error) {
@@ -1147,12 +1345,29 @@ func healthStatus() string {
 }
 
 func instanceAwareHealth() string {
+	// Same source-of-truth rule as collectInstanceRows: the config
+	// file wins, meta is only a fallback. The effective health port
+	// is the first instance's (see warnFirstInstanceOnly in
+	// cmd/xboard-node: only instances[0].HealthPort is ever served),
+	// so a stale meta port must not shadow it.
 	port := 0
-	if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
-		for _, inst := range meta.Instances {
-			if inst.HealthPort > 0 {
-				port = inst.HealthPort
-				break
+	if root, err := config.LoadRoot(defaultConfigPath); err == nil {
+		if instances, normErr := root.NormalizeInstances(); normErr == nil && len(instances) > 0 {
+			port = instances[0].HealthPort
+		}
+		// Top-level health_port is part of the config too and must
+		// be consulted before any meta fallback.
+		if port == 0 {
+			port = root.HealthPort
+		}
+	}
+	if port == 0 {
+		if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
+			for _, inst := range meta.Instances {
+				if inst.HealthPort > 0 {
+					port = inst.HealthPort
+					break
+				}
 			}
 		}
 	}
@@ -1294,8 +1509,11 @@ func runConfigInit(args []string) error {
 	)
 
 	for i := 0; i < len(args); i++ {
+		// Every config-init flag takes a value: a trailing flag used
+		// to be silently dropped (break), so e.g. a missing --token
+		// value could pass validation and still "succeed".
 		if i+1 >= len(args) {
-			break
+			return fmt.Errorf("missing value for %s", args[i])
 		}
 		switch args[i] {
 		case "--config":
@@ -1365,6 +1583,11 @@ func runConfigInit(args []string) error {
 		case "--version":
 			i++
 			releaseVersion = args[i]
+		default:
+			// Unknown flags used to be silently skipped (and their
+			// value then misparsed as the next flag), so a typo'd
+			// bind flag could look successful while doing nothing.
+			return fmt.Errorf("unknown config init flag: %s", args[i])
 		}
 	}
 
@@ -1464,10 +1687,46 @@ func runConfigInit(args []string) error {
 	}
 
 	// Merge: replace if same ID exists, otherwise append.
+	// A same-ID rebind used to replace the whole instance with a fresh
+	// one, wiping operator customisation (health port, custom_config /
+	// custom_route, cert, node/WS intervals, log level, config_dir).
+	// Now a rebind starts from the existing instance and only updates
+	// binding-related fields (panel URL, token env, node/machine ID,
+	// node type when given, kernel when given, health port / runtime
+	// tuning when explicitly given); everything else is preserved.
 	replaced := false
 	for i, existing := range instances {
 		if existing.InstanceID == instanceID {
-			instances[i] = inst
+			merged := existing
+			merged.Panel.URL = panelURL
+			merged.Panel.Token = ""
+			if mode == "machine" {
+				if merged.Machine == nil {
+					merged.Machine = &config.MachineConfig{}
+				}
+				merged.Machine.MachineID = machineID
+				merged.Machine.Token = ""
+				merged.Machine.TokenEnv = envKey
+			} else {
+				merged.Panel.NodeID = nodeID
+				if nodeType != "" {
+					merged.Panel.NodeType = nodeType
+				}
+				merged.Panel.TokenEnv = envKey
+			}
+			if kernelType != "" {
+				merged.Kernel.Type = kernelType
+			}
+			if healthPort > 0 {
+				merged.HealthPort = healthPort
+			}
+			if gomemlimit != "" {
+				merged.Runtime.GoMemLimit = gomemlimit
+			}
+			if gogc > 0 {
+				merged.Runtime.GoGCPercent = gogc
+			}
+			instances[i] = merged
 			replaced = true
 			break
 		}
@@ -1544,6 +1803,9 @@ func mergeCredentials(srcPath, dstPath, key, value string) error {
 // writeInstallMetaVersioned writes install-meta.json with an explicit
 // version and latest-instance-ID. When latestID is empty, the last
 // instance in the config is used (backward compat with writeInstallMeta).
+// The old loop assigned latestID on the first iteration and never
+// overwrote it, so it silently meant the FIRST instance despite this
+// comment; it is now resolved after the loop to the last item.
 func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latestID string) error {
 	if ver == "" {
 		ver = "unknown"
@@ -1554,9 +1816,6 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 		id, err := inst.AutoInstanceID()
 		if err != nil {
 			return err
-		}
-		if latestID == "" {
-			latestID = id
 		}
 		item := instanceSummary{
 			ID:         id,
@@ -1570,6 +1829,9 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 			item.NodeID = nil
 		}
 		items = append(items, item)
+	}
+	if latestID == "" && len(items) > 0 {
+		latestID = items[len(items)-1].ID
 	}
 	meta := installMeta{
 		ConfigMode:       "instances",

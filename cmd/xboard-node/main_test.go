@@ -2,6 +2,8 @@ package main
 
 import (
 	"testing"
+
+	"github.com/cedar2025/xboard-node/internal/config"
 )
 
 func TestParseMemLimitStrict(t *testing.T) {
@@ -29,4 +31,46 @@ func TestParseMemLimitStrict(t *testing.T) {
 			t.Errorf("parseMemLimit(%q) = %d, want error", in, got)
 		}
 	}
+}
+
+func TestCountServices(t *testing.T) {
+	nodeInst := func(nodes ...int) *config.Config {
+		c := &config.Config{}
+		for _, id := range nodes {
+			c.Nodes = append(c.Nodes, config.NodeEntry{NodeID: id})
+		}
+		return c
+	}
+	machineInst := func() *config.Config {
+		return &config.Config{Machine: &config.MachineConfig{MachineID: 1}}
+	}
+	// Single instance, three nodes: three services, not one. The old
+	// errCh sizing (len(instances) = 1) deadlocked exactly this case.
+	if got := countServices([]*config.Config{nodeInst(1, 2, 3)}); got != 3 {
+		t.Fatalf("single multi-node instance: got %d, want 3", got)
+	}
+	if got := countServices([]*config.Config{nodeInst(5), machineInst()}); got != 2 {
+		t.Fatalf("node + machine instances: got %d, want 2", got)
+	}
+	if got := countServices(nil); got != 1 {
+		t.Fatalf("empty instances: got %d, want >= 1", got)
+	}
+}
+
+func TestWarnFirstInstanceOnlyDoesNotPanic(t *testing.T) {
+	first := &config.Config{
+		HealthPort: 65530,
+		Log:        config.LogConfig{Level: "info", Output: "stdout"},
+		Runtime:    config.RuntimeConfig{GoMemLimit: "256MiB"},
+	}
+	second := &config.Config{
+		HealthPort: 65531,
+		Log:        config.LogConfig{Level: "debug", Output: "stdout"},
+		Runtime:    config.RuntimeConfig{GoMemLimit: "128MiB"},
+	}
+	// Smoke test: differing later-instance settings must be handled
+	// (warned about) without panicking, including empty input.
+	warnFirstInstanceOnly([]*config.Config{first, second})
+	warnFirstInstanceOnly([]*config.Config{first})
+	warnFirstInstanceOnly(nil)
 }

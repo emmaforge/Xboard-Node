@@ -246,10 +246,17 @@ func compilePanelRouteRule(pr model.RouteRule) []M {
 	case "direct":
 		outbound = "direct"
 	case "dns":
+		// A dns action with an explicit target routes there; without
+		// one it must NOT reference the never-defined "dns-out"
+		// outbound (sing-box rejects routes to unknown outbounds).
+		// Fall back to "direct" — DNS traffic is not proxied by
+		// default — and log it, mirroring the xray kernel's dns
+		// fallback so both kernels agree.
 		if pr.ActionValue != "" {
 			outbound = pr.ActionValue
 		} else {
-			outbound = "dns-out"
+			nlog.Core().Warn("sing-box: panel dns route without a target, routing direct instead of nonexistent dns-out")
+			outbound = "direct"
 		}
 	case "proxy":
 		if pr.ActionValue != "" {
@@ -538,6 +545,15 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		return buildTrojan(base, nc, users, tc)
 	case "hysteria":
 		return buildHysteria(base, nc, users, tc)
+	case "hysteria2":
+		// Protocols() advertises "hysteria2", so a panel that sends
+		// the literal string must yield a hysteria2 inbound instead of
+		// nil (which buildConfig would silently drop, starting a node
+		// with no inbound). Force Version 2 regardless of the panel's
+		// Version field: the protocol name itself selects v2.
+		nc2 := *nc
+		nc2.Version = 2
+		return buildHysteria(base, &nc2, users, tc)
 	case "tuic":
 		return buildTUIC(base, nc, users, tc)
 	case "anytls":
@@ -887,6 +903,43 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLS
 	return base
 }
 
+// wsHeadersWithHost merges a WS host field into a headers value under the
+// unified priority rule shared with the xray kernel: an explicit Host
+// header (matched case-insensitively) wins over the host field; the host
+// field only supplies Host when headers carry none. A non-map headers
+// value is passed through verbatim (the host field cannot be merged into
+// it), and no headers/host at all yields nil so callers omit the key.
+func wsHeadersWithHost(headersVal interface{}, hasHeaders bool, hostVal interface{}, hasHost bool) interface{} {
+	if !hasHeaders {
+		if !hasHost {
+			return nil
+		}
+		return M{"Host": hostVal}
+	}
+	switch h := headersVal.(type) {
+	case M: // M is an alias for map[string]interface{}, so this covers both.
+		merged := make(M, len(h)+1)
+		for k, v := range h {
+			merged[k] = v
+		}
+		if hasHost {
+			hasHostKey := false
+			for k := range merged {
+				if strings.EqualFold(k, "Host") {
+					hasHostKey = true
+					break
+				}
+			}
+			if !hasHostKey {
+				merged["Host"] = hostVal
+			}
+		}
+		return merged
+	default:
+		return headersVal
+	}
+}
+
 func applyTransport(base M, nc *model.NodeSpec) {
 	if nc.Network == "" || nc.Network == "tcp" {
 		return
@@ -900,13 +953,21 @@ func applyTransport(base M, nc *model.NodeSpec) {
 			if v, ok := nc.NetworkSettings["path"]; ok {
 				transport["path"] = v
 			}
+			// WS host priority, unified with the xray kernel: an
+			// explicit Host header in headers wins over the host
+			// field; the host field only fills in a missing Host.
+			// (Previously any headers value at all suppressed the
+			// host field, even headers without a Host entry.)
+			var headersVal, hostVal interface{}
+			var hasHeaders, hasHost bool
 			if v, ok := nc.NetworkSettings["headers"]; ok {
-				transport["headers"] = v
+				headersVal, hasHeaders = v, true
 			}
 			if v, ok := nc.NetworkSettings["host"]; ok {
-				if transport["headers"] == nil {
-					transport["headers"] = M{"Host": v}
-				}
+				hostVal, hasHost = v, true
+			}
+			if merged := wsHeadersWithHost(headersVal, hasHeaders, hostVal, hasHost); merged != nil {
+				transport["headers"] = merged
 			}
 			if v, ok := nc.NetworkSettings["max_early_data"]; ok {
 				transport["max_early_data"] = v

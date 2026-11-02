@@ -58,6 +58,11 @@ type SingBox struct {
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
 
+	// deviceLimitRejectedFunc is called once per device-limit rejection.
+	// Set once by SetDeviceLimitRejectedFunc and forwarded to every new
+	// ConnTracker, like the limit funcs above.
+	deviceLimitRejectedFunc func()
+
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
 	trackerRegistered bool
@@ -93,6 +98,16 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// The kernel interface promises that calling Start on an
+	// already-running kernel stops the old instance first. Creating the
+	// new instance before stopping the old one let the new listener
+	// fail with EADDRINUSE on the still-bound port, so stop the old
+	// instance (listeners closed, then drain, then hard close) before
+	// building the replacement.
+	if s.box != nil {
+		s.stop()
+	}
+
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
@@ -109,12 +124,6 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		cancel()
 		return fmt.Errorf("parse sing-box options: %w", err)
 	}
-
-	// Save old state before creating the new instance.
-	oldBox := s.box
-	oldCancel := s.cancel
-	oldCtx := s.ctx
-	oldTracker := s.connTracker
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -148,45 +157,15 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	if s.deviceLimitFunc != nil {
 		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
 	}
+	if s.deviceLimitRejectedFunc != nil {
+		s.connTracker.SetDeviceLimitRejectedFunc(s.deviceLimitRejectedFunc)
+	}
 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)
 
-	// Recycle old instance in background — drain then close.
-	if oldBox != nil {
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
-	}
-
 	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil
-}
-
-// recycleOldBox gracefully shuts down a previous sing-box instance in the
-// background. It closes listen sockets first, waits for connections to drain,
-// then hard-closes. This avoids blocking the new instance's startup.
-func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
-	// Step 1: close listen sockets so no new connections arrive on old ports.
-	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
-		_ = im.Close()
-	}
-
-	// Step 2: drain in-flight connections (best-effort).
-	if oldTracker != nil {
-		deadline := time.Now().Add(drainTimeout)
-		for time.Now().Before(deadline) {
-			if oldTracker.ActiveCount() == 0 {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	// Step 3: hard-close everything.
-	oldBox.Close()
-	if oldCancel != nil {
-		oldCancel()
-	}
-	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
 // Reload hot-swaps the inbound users and routing rules without restarting the box.
@@ -221,12 +200,14 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("router not available")
 	}
 
-	// Update routing rules
+	// Update routing rules. A failure here must be reported, not merely
+	// logged: returning success while the new rules are not in effect
+	// would leave the service layer believing the reload worked and
+	// skip its fallback path.
 	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		nlog.Core().Debug("routing reload failed", "error", err)
-	} else {
-		nlog.Core().Debug("sing-box routing reloaded")
+		return fmt.Errorf("update routing rules: %w", err)
 	}
+	nlog.Core().Debug("sing-box routing reloaded")
 
 	nopFactory := singLog.NewNOPFactory()
 
@@ -281,6 +262,14 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 					case *option.HTTPMixedInboundOptions:
 						err = v.UpdateUsers(opts.Users)
 					}
+				default:
+					// Inbounds that do not implement any UpdatableInbound
+					// (e.g. hysteria v1, mieru in builds where the inbound
+					// is not updatable) must NOT be silently skipped: with
+					// err left nil the loop would `continue` and a pure
+					// user change would never reach the inbound. Fall
+					// through to inbound reconstruction below.
+					err = fmt.Errorf("inbound %s does not support incremental user update, recreating", tag)
 				}
 				if err == nil {
 					continue
@@ -406,6 +395,19 @@ func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	}
 }
 
+// SetDeviceLimitRejectedFunc configures the callback invoked once per
+// connection rejected by the device-limit gate (TCP and UDP alike). It is
+// stored so full restarts (which create a fresh ConnTracker) keep it, and
+// forwarded to the current tracker when one exists.
+func (s *SingBox) SetDeviceLimitRejectedFunc(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deviceLimitRejectedFunc = fn
+	if s.connTracker != nil {
+		s.connTracker.SetDeviceLimitRejectedFunc(fn)
+	}
+}
+
 // UpdateGlobalDevices updates the global device state from panel (for multi-node).
 func (s *SingBox) UpdateGlobalDevices(users map[int][]string) {
 	s.mu.RLock()
@@ -435,26 +437,20 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 		return 0, fmt.Errorf("not running")
 	}
 
-	existing := make(map[int]struct{}, len(s.users))
-	for _, u := range s.users {
-		existing[u.ID] = struct{}{}
-	}
-	var toAdd []model.UserSpec
-	for _, u := range users {
-		if _, dup := existing[u.ID]; !dup {
-			toAdd = append(toAdd, u)
-		}
-	}
-	if len(toAdd) == 0 {
+	// Merge by ID, like xray: a new ID is added, and an existing ID
+	// whose UUID rotated is updated in place. Deduplicating on ID alone
+	// used to silently ignore UUID rotations, leaving the old UUID
+	// valid and the new one unusable.
+	merged, changed := mergeUsers(s.users, users)
+	if changed == 0 {
 		return 0, nil
 	}
 
-	merged := append(append([]model.UserSpec{}, s.users...), toAdd...)
 	if err := s.reloadInboundsLocked(merged); err != nil {
 		return 0, err
 	}
 	s.users = merged
-	return len(toAdd), nil
+	return changed, nil
 }
 
 // RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
@@ -591,6 +587,11 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 				case *option.HTTPMixedInboundOptions:
 					err = v.UpdateUsers(opts.Users)
 				}
+			default:
+				// Same silent-skip guard as Reload: an inbound without
+				// an UpdatableInbound implementation must fall back to
+				// reconstruction instead of being skipped with err == nil.
+				err = fmt.Errorf("inbound %s does not support incremental user update, recreating", tag)
 			}
 			if err == nil {
 				continue
@@ -643,6 +644,31 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	}
 	ct.CloseByUUID(uuid)
 	return nil
+}
+
+// mergeUsers merges incoming user specs into the current list by ID and
+// reports how many entries changed (new IDs plus UUID rotations on
+// existing IDs). Unchanged IDs are left untouched. The merged list keeps
+// the current users' order, with new users appended.
+func mergeUsers(current, incoming []model.UserSpec) (merged []model.UserSpec, changed int) {
+	byID := make(map[int]int, len(current))
+	merged = append([]model.UserSpec{}, current...)
+	for i, u := range merged {
+		byID[u.ID] = i
+	}
+	for _, u := range incoming {
+		if idx, exists := byID[u.ID]; exists {
+			if merged[idx].UUID != u.UUID {
+				merged[idx] = u
+				changed++
+			}
+			continue
+		}
+		byID[u.ID] = len(merged)
+		merged = append(merged, u)
+		changed++
+	}
+	return merged, changed
 }
 
 // buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute

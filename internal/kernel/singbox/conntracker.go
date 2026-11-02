@@ -145,6 +145,13 @@ type ConnTracker struct {
 	// deviceLimitFunc resolves a user UUID to their device limit.
 	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
 
+	// deviceLimitRejectedFunc, when set, is called once per connection
+	// rejected by the device-limit gate. It lets the service layer count
+	// rejections (e.g. limiter.RecordDeviceLimitEvent) without the
+	// tracker depending on the service layer. It is invoked outside any
+	// tracker lock, and must itself be cheap and non-blocking.
+	deviceLimitRejectedFunc atomic.Pointer[func()]
+
 	// Multi-node device state from panel
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
@@ -171,6 +178,21 @@ func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 // SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
 func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 	t.deviceLimitFunc.Store(&fn)
+}
+
+// SetDeviceLimitRejectedFunc configures the callback invoked once per
+// connection rejected by the device-limit gate (TCP and UDP alike). A
+// nil fn clears the callback.
+func (t *ConnTracker) SetDeviceLimitRejectedFunc(fn func()) {
+	t.deviceLimitRejectedFunc.Store(&fn)
+}
+
+// notifyDeviceLimitRejected invokes the rejection callback, if set, outside
+// any tracker lock. Callers must only invoke it on the rejection path.
+func (t *ConnTracker) notifyDeviceLimitRejected() {
+	if p := t.deviceLimitRejectedFunc.Load(); p != nil && *p != nil {
+		(*p)()
+	}
 }
 
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
@@ -233,20 +255,26 @@ func (t *ConnTracker) RoutedConnection(
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 
-	// Device limit gate-keeping
+	// Device limit gate-keeping. The gate and the registration must be
+	// atomic: checkDeviceGate followed by addConn left a window where
+	// two concurrent connections from new IPs could both observe a
+	// count under the limit and both be admitted.
+	registered := false
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
 		if limit, hasLimit := (*dlf)(uuid); hasLimit {
-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
+			if !t.gateDeviceAndRegister(us, uid, sourceIP, limit) {
 				nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
 					"user", uuid, "ip", sourceIP, "limit", limit)
+				t.notifyDeviceLimitRejected()
 				conn.Close()
 				return conn
 			}
+			registered = true
 		}
 	}
 
-	// Register connection
-	if us != nil {
+	// Register connection (unless the gate already registered it).
+	if !registered && us != nil {
 		us.addConn(sourceIP)
 	}
 
@@ -294,19 +322,23 @@ func (t *ConnTracker) RoutedPacketConnection(
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 
-	// Device limit gate-keeping
+	// Device limit gate-keeping (atomic gate + register, see
+	// RoutedConnection).
+	registered := false
 	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
 		if limit, hasLimit := (*dlf)(uuid); hasLimit {
-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
+			if !t.gateDeviceAndRegister(us, uid, sourceIP, limit) {
 				nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
 					"user", uuid, "ip", sourceIP, "limit", limit)
+				t.notifyDeviceLimitRejected()
 				conn.Close()
 				return conn
 			}
+			registered = true
 		}
 	}
 
-	if us != nil {
+	if !registered && us != nil {
 		us.addConn(sourceIP)
 	}
 
@@ -419,6 +451,80 @@ func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string
 	nlog.Core().Debug("device limit: total over limit, rejecting",
 		"userID", userID, "ip", sourceIP, "totalIPs", len(allIPs), "limit", limit)
 	return true
+}
+
+// gateDeviceAndRegister is the atomic form of checkDeviceGate + addConn:
+// it re-checks the merged local + global device count and registers the
+// connection while holding us.mu, so concurrent connections from new IPs
+// cannot both slip under the limit. It returns true when the connection
+// is admitted (and registered), false when it must be rejected. An
+// unknown user (us == nil) or a non-positive limit admits without
+// registering, matching the previous behaviour.
+func (t *ConnTracker) gateDeviceAndRegister(us *userStats, userID int, sourceIP string, limit int) bool {
+	if us == nil || limit <= 0 {
+		return true
+	}
+
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	if us.ips == nil {
+		us.ips = make(map[string]int)
+	}
+	// Already known locally: always admitted, refcounted.
+	if us.ips[sourceIP] > 0 {
+		us.connCount++
+		us.ips[sourceIP]++
+		return true
+	}
+
+	// Snapshot global state. Lock order is us.mu -> globalMu, the same
+	// as checkDeviceGate; UpdateGlobalDevices only takes globalMu, so
+	// no lock-order cycle exists. The global map is replaced wholesale
+	// on update, so the snapshot stays valid after RUnlock.
+	t.globalMu.RLock()
+	stale := time.Since(t.globalLastUpdate) > 60*time.Second
+	globalIPs := t.globalDevices[userID]
+	t.globalMu.RUnlock()
+
+	// Known globally (from another node): admitted, counted locally.
+	if !stale && globalIPs != nil && globalIPs[sourceIP] {
+		us.connCount++
+		us.ips[sourceIP]++
+		return true
+	}
+
+	merged := make(map[string]bool, len(us.ips)+1)
+	for ip := range us.ips {
+		merged[ip] = true
+	}
+	if !stale && globalIPs != nil {
+		for ip := range globalIPs {
+			merged[ip] = true
+		}
+	}
+
+	if len(merged) < limit {
+		us.connCount++
+		us.ips[sourceIP]++
+		return true
+	}
+
+	// Over limit: deterministic lexicographic admission, same rule as
+	// checkDeviceGate, but decided under the write lock.
+	ipList := make([]string, 0, len(merged)+1)
+	for ip := range merged {
+		ipList = append(ipList, ip)
+	}
+	ipList = append(ipList, sourceIP)
+	sort.Strings(ipList)
+	for i := 0; i < limit && i < len(ipList); i++ {
+		if ipList[i] == sourceIP {
+			us.connCount++
+			us.ips[sourceIP]++
+			return true
+		}
+	}
+	return false
 }
 
 func (t *ConnTracker) nextID() string {
@@ -845,16 +951,35 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	// Packet-relay direction must match the direct ReadPacket/WritePacket
+	// path: reading from the inbound is user upload, writing to the
+	// inbound is user download. (These were previously swapped, so UDP
+	// relay traffic counted upload as download and vice versa, while
+	// TCP/stream traffic counted correctly.)
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }
 func (c *trackedPacketConn) ReaderReplaceable() bool { return true }
-func (c *trackedPacketConn) WriterReplaceable() bool { return true }
+
+// WriterReplaceable must be false: sing's UnwrapCountPacketWriter peels
+// WriterReplaceable layers BEFORE checking for counters, so a replaceable
+// counting wrapper is peeled away and its writer CountFunc is never
+// collected — CopyPacket download traffic through this conn was silently
+// uncounted (not merely swapped). The read side is unaffected because
+// UnwrapCountPacketReader collects counters BEFORE peeling. This matches
+// sing's own CounterPacketConn, which implements no Replaceable method at
+// all (i.e. it is not replaceable). Peeling still stops here in the
+// production chains (raw → Cached → tracked, and FakeIP NAT → tracked):
+// the final writer after unwrapping is the same inner conn as before,
+// only the download CountFunc is now collected as well. The only other
+// consumer of this interface is sing's CopyPacket; no sing-box code
+// casts or replaces the inbound packet writer, so nothing else changes.
+func (c *trackedPacketConn) WriterReplaceable() bool { return false }

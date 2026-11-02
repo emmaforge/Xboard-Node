@@ -423,3 +423,322 @@ func TestWSConnectLogRedactsToken(t *testing.T) {
 		t.Errorf("expected the masked token in the log line, got:\n%s", out)
 	}
 }
+
+// TestWSClient_FirstMessageReadTimeout proves connect() does not block
+// forever when the panel accepts the handshake but never sends the
+// first (auth) message: the read must fail within HandshakeTimeout
+// instead of hanging until the caller's context is cancelled.
+func TestWSClient_FirstMessageReadTimeout(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Never send auth.success (or anything else); block until
+		// the client gives up and closes the connection.
+		for {
+			var msg wsMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	ws := NewWSClient("ws://"+host, "timeout-token", 1,
+		WSClientConfig{HandshakeTimeout: 200 * time.Millisecond}, nil, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := ws.connect(ctx)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected connect() to fail on first-message timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "read auth response") {
+		t.Errorf("error = %v, want it to mention the auth-response read", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("connect() took %v, want it to fail near HandshakeTimeout, not hang", elapsed)
+	}
+	if ws.IsConnected() {
+		t.Error("expected IsConnected() = false after first-message timeout")
+	}
+}
+
+// TestWSClient_SilentPeerDetectedByReadDeadline proves a connection to
+// a peer that stops speaking (and never answers control pings, i.e. a
+// half-open / dead peer) is detected and reported disconnected, so
+// Run() can reconnect, instead of staying "connected" forever.
+func TestWSClient_SilentPeerDetectedByReadDeadline(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Swallow control pings without ponging: this is the
+		// half-open peer. The default gorilla ping handler would
+		// pong and keep the connection alive, which is not the
+		// case under test.
+		conn.SetPingHandler(func(string) error { return nil })
+		if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+			return
+		}
+		for {
+			var msg wsMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	var mu sync.Mutex
+	var sawConnected, sawDisconnected bool
+	ws := NewWSClient("ws://"+host, "silent-token", 1,
+		WSClientConfig{StatusInterval: 100 * time.Millisecond, BackoffInitial: 100 * time.Millisecond, BackoffMax: 200 * time.Millisecond},
+		func(WSEvent) {},
+		func(s WSStatusChange) {
+			mu.Lock()
+			if s.Connected {
+				sawConnected = true
+			} else if sawConnected {
+				sawDisconnected = true
+			}
+			mu.Unlock()
+		},
+		nil, // no node.status traffic: only control pings probe the peer
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		done := sawConnected && sawDisconnected
+		mu.Unlock()
+		if done {
+			return
+		}
+		select {
+		case <-deadline:
+			mu.Lock()
+			t.Fatalf("silent peer was not reported disconnected (connected=%v disconnected=%v)", sawConnected, sawDisconnected)
+			mu.Unlock()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// TestWSClient_PongKeepsConnectionAlive is the positive control for the
+// read deadline: a peer that answers control pings (the default
+// gorilla behaviour, and what a live panel does) must NOT be dropped
+// even though it sends no data messages for well over pongWait.
+func TestWSClient_PongKeepsConnectionAlive(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+			return
+		}
+		// Default ping handler pongs; no data messages are sent.
+		for {
+			var msg wsMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	var mu sync.Mutex
+	var sawConnected, sawDisconnected bool
+	ws := NewWSClient("ws://"+host, "pong-token", 1,
+		WSClientConfig{StatusInterval: 100 * time.Millisecond},
+		func(WSEvent) {},
+		func(s WSStatusChange) {
+			mu.Lock()
+			if s.Connected {
+				sawConnected = true
+			} else {
+				sawDisconnected = true
+			}
+			mu.Unlock()
+		},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	// pongWait is 3 x StatusInterval = 300ms; observing for 1.5s
+	// covers several missed-tick windows if pongs were ignored.
+	time.Sleep(1500 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if !sawConnected {
+		t.Fatal("expected the client to connect")
+	}
+	if sawDisconnected {
+		t.Error("ponging peer was reported disconnected, want it to stay connected")
+	}
+	if !ws.IsConnected() {
+		t.Error("expected IsConnected() = true for a ponging peer")
+	}
+}
+
+// TestWSClient_SendDeviceReportErrors covers the SendDeviceReport /
+// SendDeviceReportForNode error contract: not connected, no write
+// channel, and a full channel all return a non-nil error, and a
+// queued report returns nil with the expected event and payload.
+func TestWSClient_SendDeviceReportErrors(t *testing.T) {
+	devices := map[int][]string{1: {"10.0.0.1", "10.0.0.2"}}
+
+	t.Run("not connected", func(t *testing.T) {
+		ws := NewWSClient("ws://127.0.0.1:19999", "x", 1, WSClientConfig{}, nil, nil, nil)
+		if err := ws.SendDeviceReport(devices); err == nil {
+			t.Error("SendDeviceReport on a disconnected client = nil, want non-nil error")
+		}
+		if err := ws.SendDeviceReportForNode(7, devices); err == nil {
+			t.Error("SendDeviceReportForNode on a disconnected client = nil, want non-nil error")
+		}
+	})
+
+	t.Run("connected but no channel", func(t *testing.T) {
+		ws := NewWSClient("ws://127.0.0.1:19999", "x", 1, WSClientConfig{}, nil, nil, nil)
+		ws.connected.Store(true) // channel deliberately left nil
+		if err := ws.SendDeviceReport(devices); err == nil {
+			t.Error("SendDeviceReport with nil writeCh = nil, want non-nil error")
+		}
+	})
+
+	t.Run("channel full", func(t *testing.T) {
+		ws := NewWSClient("ws://127.0.0.1:19999", "x", 1, WSClientConfig{}, nil, nil, nil)
+		ws.connected.Store(true)
+		ch := make(chan wsMessage, 1)
+		ws.mu.Lock()
+		ws.writeCh = ch
+		ws.mu.Unlock()
+		ch <- wsMessage{Event: "fill"} // occupy the only slot
+		if err := ws.SendDeviceReport(devices); err == nil {
+			t.Error("SendDeviceReport on a full channel = nil, want non-nil error")
+		} else if !strings.Contains(err.Error(), "full") {
+			t.Errorf("full-channel error = %v, want it to mention the full channel", err)
+		}
+	})
+
+	t.Run("queued with node id", func(t *testing.T) {
+		ws := NewWSClient("ws://127.0.0.1:19999", "x", 1, WSClientConfig{}, nil, nil, nil)
+		ws.connected.Store(true)
+		ch := make(chan wsMessage, 16)
+		ws.mu.Lock()
+		ws.writeCh = ch
+		ws.mu.Unlock()
+		if err := ws.SendDeviceReportForNode(7, devices); err != nil {
+			t.Fatalf("SendDeviceReportForNode queued = %v, want nil", err)
+		}
+		select {
+		case msg := <-ch:
+			if msg.Event != WSEventReportDevices {
+				t.Errorf("queued event = %q, want %q", msg.Event, WSEventReportDevices)
+			}
+			var payload map[string]interface{}
+			if err := json.Unmarshal(msg.Data, &payload); err != nil {
+				t.Fatalf("cannot decode queued payload: %v", err)
+			}
+			if payload["node_id"] != float64(7) {
+				t.Errorf("payload node_id = %v, want 7", payload["node_id"])
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for the queued device report")
+		}
+	})
+
+	t.Run("queued legacy mode", func(t *testing.T) {
+		ws := NewWSClient("ws://127.0.0.1:19999", "x", 1, WSClientConfig{}, nil, nil, nil)
+		ws.connected.Store(true)
+		ch := make(chan wsMessage, 16)
+		ws.mu.Lock()
+		ws.writeCh = ch
+		ws.mu.Unlock()
+		if err := ws.SendDeviceReport(devices); err != nil {
+			t.Fatalf("SendDeviceReport queued = %v, want nil", err)
+		}
+		select {
+		case msg := <-ch:
+			if msg.Event != WSEventReportDevices {
+				t.Errorf("queued event = %q, want %q", msg.Event, WSEventReportDevices)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for the queued device report")
+		}
+	})
+}
+
+// TestWSClient_ConcurrentSendNoRace drives all three send paths from
+// many goroutines while a live connection runs and then disconnects.
+// It asserts nothing about delivery by itself: run it with -race and
+// any unsynchronised access to writeCh / connected fails the test.
+func TestWSClient_ConcurrentSendNoRace(t *testing.T) {
+	server := fakeWSServer(t, nil)
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	ws := NewWSClient("ws://"+host, "race-token", 1,
+		WSClientConfig{StatusInterval: 100 * time.Millisecond},
+		func(WSEvent) {}, nil,
+		func() map[string]interface{} { return map[string]interface{}{"online": 1} })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(3 * time.Second)
+	for !ws.IsConnected() {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for connection")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_ = ws.SendDeviceReport(map[int][]string{id: {"10.0.0.1"}})
+				ws.SendNodeStatus(id, map[string]interface{}{"online": 1})
+				ws.SendRaw("test.event", json.RawMessage(`{}`))
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Disconnect while senders are still in flight: a final burst
+	// must neither panic nor race, whatever it returns.
+	cancel()
+	for i := 0; i < 50; i++ {
+		_ = ws.SendDeviceReport(devicesForRaceTest)
+		ws.SendRaw("test.event", json.RawMessage(`{}`))
+	}
+}
+
+var devicesForRaceTest = map[int][]string{1: {"10.0.0.1"}}

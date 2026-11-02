@@ -179,6 +179,6 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 
 func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }
-func (p *panelPushClient) SendDeviceReport(devices map[int][]string) {
-	p.inner.SendDeviceReport(devices)
+func (p *panelPushClient) SendDeviceReport(devices map[int][]string) error {
+	return p.inner.SendDeviceReport(devices)
 }

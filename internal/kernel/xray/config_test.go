@@ -49,7 +49,13 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		},
 	}
 
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+
+	if err != nil {
+
+		t.Fatalf("buildConfig() error = %v", err)
+
+	}
 	outbounds := cfg["outbounds"].([]M)
 
 	// Since we overrode both 'direct' and 'block', the result should contain
@@ -164,7 +170,10 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 
 	for _, tc := range protocols {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+			cfg, err := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+			if err != nil {
+				t.Fatalf("buildConfig() error = %v", err)
+			}
 
 			data, err := json.Marshal(cfg)
 			if err != nil {
@@ -197,7 +206,10 @@ func TestBuildConfig_VMess_Users(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -237,7 +249,10 @@ func TestBuildConfig_VLESS_Flow(t *testing.T) {
 			"server_name": "example.com",
 		},
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -346,27 +361,34 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 	if len(xrayRules) != 6 {
 		t.Fatalf("expected 6 rules, got %d", len(xrayRules))
 	}
-	if xrayRules[0]["outboundTag"] != "warp-jp" {
-		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[0]["outboundTag"])
+	// Private-segment block is now first, ahead of structured rules.
+	if xrayRules[0]["outboundTag"] != "block" {
+		t.Fatalf("expected private block first, got %v", xrayRules[0]["outboundTag"])
 	}
-	if got := xrayRules[0]["domain"].([]string); len(got) != 2 || got[0] != "full.example.com" || got[1] != "domain:example.org" {
+	if xrayRules[1]["outboundTag"] != "warp-jp" {
+		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[1]["outboundTag"])
+	}
+	if got := xrayRules[1]["domain"].([]string); len(got) != 2 || got[0] != "full.example.com" || got[1] != "domain:example.org" {
 		t.Fatalf("unexpected custom domains: %v", got)
 	}
-	if got := xrayRules[1]["port"]; got != "80,443-445" {
+	if got := xrayRules[2]["port"]; got != "80,443-445" {
 		t.Fatalf("unexpected port matcher: %v", got)
 	}
-	if got := xrayRules[2]["network"]; got != "tcp,udp" {
+	if got := xrayRules[3]["network"]; got != "tcp,udp" {
 		t.Fatalf("unexpected network matcher: %v", got)
 	}
-	if got := xrayRules[3]["source"].([]string); len(got) != 1 || got[0] != "192.168.1.0/24" {
+	if got := xrayRules[4]["source"].([]string); len(got) != 1 || got[0] != "192.168.1.0/24" {
 		t.Fatalf("unexpected source cidr matcher: %v", got)
 	}
-	if got := xrayRules[4]["sourcePort"]; got != "1000-1002" {
+	if got := xrayRules[5]["sourcePort"]; got != "1000-1002" {
 		t.Fatalf("unexpected source port matcher: %v", got)
 	}
 }
 
-func TestBuildRouting_StructuredCustomRulesRemainFirst(t *testing.T) {
+func TestBuildRouting_PrivateBlockPrecedesCustomRules(t *testing.T) {
+	// Private block first (SSRF guard), then structured, then raw:
+	// a structured rule covering a private CIDR is shadowed by the
+	// block, and a raw rule can no longer bypass it either.
 	raw := []map[string]any{{"type": "field", "domain": []string{"keyword:raw"}, "outboundTag": "raw-tag"}}
 	custom := []model.CustomRouteRule{{
 		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
@@ -374,11 +396,28 @@ func TestBuildRouting_StructuredCustomRulesRemainFirst(t *testing.T) {
 	}}
 	routing := buildRouting(nil, custom, raw)
 	xrayRules := routing["rules"].([]M)
-	if xrayRules[0]["outboundTag"] != "direct" {
-		t.Fatalf("expected structured rule first, got %v", xrayRules[0]["outboundTag"])
+	if len(xrayRules) != 3 {
+		t.Fatalf("expected 3 rules, got %d", len(xrayRules))
 	}
-	if xrayRules[1]["outboundTag"] != "raw-tag" {
-		t.Fatalf("expected raw custom rule second, got %v", xrayRules[1]["outboundTag"])
+	if xrayRules[0]["outboundTag"] != "block" {
+		t.Fatalf("expected private block first, got %v", xrayRules[0]["outboundTag"])
+	}
+	if xrayRules[1]["outboundTag"] != "direct" {
+		t.Fatalf("expected structured rule second, got %v", xrayRules[1]["outboundTag"])
+	}
+	if xrayRules[2]["outboundTag"] != "raw-tag" {
+		t.Fatalf("expected raw custom rule third, got %v", xrayRules[2]["outboundTag"])
+	}
+
+	// A structured rule for a private CIDR must also sit behind the block.
+	private := []model.CustomRouteRule{{
+		Match:  model.RouteMatch{IPCIDRs: []string{"10.0.0.0/8"}},
+		Action: model.RouteAction{Type: "direct"},
+	}}
+	routing = buildRouting(nil, private, nil)
+	xrayRules = routing["rules"].([]M)
+	if len(xrayRules) != 2 || xrayRules[0]["outboundTag"] != "block" || xrayRules[1]["outboundTag"] != "direct" {
+		t.Fatalf("private-covering structured rule must rank after the block, got %v", xrayRules)
 	}
 }
 
@@ -409,7 +448,10 @@ func TestBuildConfig_StatsEnabled(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -439,7 +481,10 @@ func TestBuildConfig_Shadowsocks_MultiUserTraditional(t *testing.T) {
 		ServerPort: 8388,
 		Cipher:     "aes-128-gcm",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -472,7 +517,10 @@ func TestBuildConfig_Shadowsocks_MultiUser(t *testing.T) {
 		Cipher:     "2022-blake3-aes-128-gcm",
 		ServerKey:  "server-key",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -496,7 +544,10 @@ func TestBuildConfig_SocksStats(t *testing.T) {
 		Protocol:   "socks",
 		ServerPort: 1080,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg, err := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v", err)
+	}
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}

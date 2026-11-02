@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,14 +32,18 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
 	// drainTimeout is how long Stop waits for in-flight connections to finish
 	// before hard-killing the instance. Skipped during hot-reload for speed.
 	drainTimeout = 5 * time.Second
+	// recycleDrainTimeout bounds the background drain of a superseded
+	// instance (see closeOld). It used to be 5 minutes, during which the
+	// old instance kept accepting connections.
+	recycleDrainTimeout = 30 * time.Second
 	// startTimeout caps how long instance.Start() may block.
 	startTimeout = 30 * time.Second
 )
@@ -73,6 +77,10 @@ type Xray struct {
 	lastKernelHash string
 	cumTraffic     map[int][2]int64
 	speedLimitFunc func(string) *rate.Limiter
+	// deviceLimitRejectedFunc is called once per device-limit rejection.
+	// Stored so it survives instance restarts (which create a fresh
+	// LimitDispatcher) and applied in updateDispatcherLimits.
+	deviceLimitRejectedFunc func()
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -156,6 +164,17 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
+	oldTag := x.inboundTag
+	// Harvest the old instance's unreported stats deltas into cumTraffic
+	// BEFORE swapping: the old instance's counters are per-instance, so
+	// resetting cumTraffic here (the old behaviour) silently dropped all
+	// traffic accumulated since the last poll. aggregateStats reads the
+	// still-current (old) instance and users, so it must run before the
+	// swap below; deltas arriving between this harvest and the old
+	// instance's close are the only remaining (sub-second) loss window.
+	if old != nil {
+		_, _ = x.aggregateStats()
+	}
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -163,13 +182,14 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
-	x.cumTraffic = make(map[int][2]int64)
+	// cumTraffic is intentionally NOT reset: it now holds the harvested
+	// old-instance totals, and the new instance's counters start at zero.
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD)
+	closeOld(old, oldLD, oldTag)
 
 	x.rememberUserEmails(users)
 	x.updateDispatcherLimits(users)
@@ -207,21 +227,41 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	return x.Start(nodeConfig, users, tls)
 }
 
-// Stop gracefully shuts down the kernel, draining active connections first.
+// Stop gracefully shuts down the kernel: close the listener first, then
+// drain in-flight connections, then hard-close on timeout. The old order
+// (drain, then close in the background) left the listener accepting
+// while draining, and with SO_REUSEPORT the kernel load-balanced new
+// connections between the old and new instances during a reload.
 func (x *Xray) Stop() {
 	x.running.Store(false)
 
 	x.mu.Lock()
 	inst := x.instance
 	ld := x.limitDispatcher
+	tag := x.inboundTag
 	x.instance = nil
 	x.limitDispatcher = nil
+	// Clearing the user ledger and kernel hash here keeps RemoveUsers'
+	// empty-set path (which stops the kernel) consistent: a later Reload
+	// must not mistake the stopped kernel for an unchanged configuration.
+	x.users = nil
+	x.lastKernelHash = ""
 	x.mu.Unlock()
 
+	if inst == nil {
+		return
+	}
+	// Step 1: close the listener so no new connections arrive.
+	removeInboundListener(inst, tag)
+	// Step 2: drain in-flight connections (best-effort, bounded).
 	if ld != nil {
 		drainConns(ld, drainTimeout)
 	}
-	closeOld(inst, ld)
+	// Step 3: hard-close everything still open, even on drain timeout.
+	inst.Close()
+	if ld != nil {
+		ld.ResetConns()
+	}
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -310,6 +350,21 @@ func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
 // SetDeviceLimitFunc is a no-op for xray — device limits are already
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
 func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
+
+// SetDeviceLimitRejectedFunc configures the callback invoked once per
+// connection rejected by the dispatcher's device-limit gate. It is stored
+// so instance restarts keep it, forwarded to the current dispatcher when
+// one exists, and re-applied in updateDispatcherLimits for dispatchers
+// created by later Starts.
+func (x *Xray) SetDeviceLimitRejectedFunc(fn func()) {
+	x.mu.Lock()
+	x.deviceLimitRejectedFunc = fn
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.SetDeviceLimitRejectedFunc(fn)
+	}
+}
 
 // UpdateGlobalDevices forwards panel-aggregated cross-node device state to
 // the LimitDispatcher, translating panel user IDs to session emails.
@@ -406,28 +461,35 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 
 	ctx := context.Background()
 	added := 0
+	failed := make(map[int]bool)
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
 			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
+			failed[u.ID] = true
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
 			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
+			failed[u.ID] = true
 			continue
 		}
 		added++
 	}
 
-	// Update bookkeeping with full merged list (new users + updated properties).
+	// Bookkeeping must reflect the kernel, not the intent: a user whose
+	// AddUser failed is NOT in the kernel, so it must not enter the
+	// x.users ledger. Otherwise the next full sync's UserDiff would see
+	// the user as already present and never retry the add.
+	ledger := ledgerAfterUserOps(merged, nil, failed, nil)
 	x.mu.Lock()
-	x.users = merged
+	x.users = ledger
 	x.mu.Unlock()
-	x.rememberUserEmails(merged)
-	x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+	x.rememberUserEmails(ledger)
+	x.updateDispatcherLimits(ledger)
+	x.updateBandwidthLimits(ledger)
 
-	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
+	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(ledger))
 	return added, nil
 }
 
@@ -537,38 +599,73 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	ctx := context.Background()
 
-	// Remove first, then add (order matters for UUID changes on same ID)
+	// Remove first, then add (order matters for UUID changes on same ID).
+	// Like AddUsers, the ledger must reflect the kernel: failed adds
+	// stay out (so a later full sync retries them) and failed removes
+	// stay in (the user is still in the kernel). Returned counts are
+	// the operations that actually succeeded, not just the diff.
+	failedAdd := make(map[int]bool)
+	failedRemove := make(map[int]bool)
+	actualAdded, actualRemoved := 0, 0
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
 		if err := um.RemoveUser(ctx, email); err != nil {
 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+			failedRemove[u.ID] = true
+			continue
 		}
+		actualRemoved++
 	}
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
 			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
+			failedAdd[u.ID] = true
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
 			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			failedAdd[u.ID] = true
+			continue
 		}
+		actualAdded++
 	}
+	ledger := ledgerAfterUserOps(users, toRemove, failedAdd, failedRemove)
 
 	x.mu.Lock()
-	x.users = users
+	x.users = ledger
 	x.mu.Unlock()
-	x.rememberUserEmails(users)
-	x.updateDispatcherLimits(users)
-	x.updateBandwidthLimits(users)
+	x.rememberUserEmails(ledger)
+	x.updateDispatcherLimits(ledger)
+	x.updateBandwidthLimits(ledger)
 
-	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
-	return
+	nlog.Core().Info("xray: users updated via UserManager", "added", actualAdded, "removed", actualRemoved, "total", len(ledger))
+	return actualAdded, actualRemoved, nil
 }
 
 var _ kernel.Kernel = (*Xray)(nil)
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
+
+// ledgerAfterUserOps builds the user ledger that matches kernel state
+// after an add/remove batch: failed adds are excluded (so a later full
+// sync's UserDiff retries them) and failed removes are retained (the
+// user is still in the kernel). `users` is the intended post-op set;
+// `toRemove` lists users the batch tried to remove.
+func ledgerAfterUserOps(users, toRemove []model.UserSpec, failedAdd, failedRemove map[int]bool) []model.UserSpec {
+	ledger := make([]model.UserSpec, 0, len(users))
+	for _, u := range users {
+		if !failedAdd[u.ID] {
+			ledger = append(ledger, u)
+		}
+	}
+	for _, u := range toRemove {
+		if failedRemove[u.ID] {
+			ledger = append(ledger, u)
+		}
+	}
+	return ledger
+}
 
 // getUserManager extracts the UserManager from the running xray instance's
 // inbound handler. Must be called with x.mu held.
@@ -724,7 +821,10 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
 func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) ([]byte, error) {
-	cfgMap := buildConfig(cfg, nc, users, tls)
+	cfgMap, err := buildConfig(cfg, nc, users, tls)
+	if err != nil {
+		return nil, err
+	}
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
@@ -750,21 +850,46 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
+// removeInboundListener closes only the inbound listener of an instance
+// (via the inbound manager's RemoveHandler), leaving already-accepted
+// connections running so they can drain. This is what makes "close the
+// listener first, then drain" possible without killing live connections.
+func removeInboundListener(inst *xrayCore.Instance, tag string) {
+	if inst == nil || tag == "" {
+		return
+	}
+	im := inst.GetFeature(inbound.ManagerType())
+	if im == nil {
+		return
+	}
+	mgr, ok := im.(inbound.Manager)
+	if !ok {
+		return
+	}
+	// Errors (e.g. handler already gone) are best-effort here: the
+	// subsequent inst.Close() still guarantees the listener is gone.
+	_ = mgr.RemoveHandler(context.Background(), tag)
+}
+
 // closeOld shuts down a previously running instance and its dispatcher.
-// Recycling happens in a background goroutine to prevent the main thread
-// from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
+// The listener is closed synchronously in the calling goroutine — before
+// Start returns — so no new connection can land on the old instance
+// (with SO_REUSEPORT a still-listening old instance would split new
+// connections with the new one). Only the drain + hard close run in the
+// background, bounded by recycleDrainTimeout; a drain timeout still ends
+// in a hard close via inst.Close().
+func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher, tag string) {
 	if inst == nil {
 		return
 	}
+	// 1. Close the listener first, synchronously.
+	removeInboundListener(inst, tag)
 	go func() {
-		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
-		// We use a much longer timeout here than the default Stop() because
-		// it's running in background and doesn't block new user connections.
+		// 2. Drain in-flight connections (best effort, bounded).
 		if ld != nil {
-			drainConns(ld, 5*time.Minute)
+			drainConns(ld, recycleDrainTimeout)
 		}
-		// 2. Hard close
+		// 3. Hard close, even if the drain timed out.
 		inst.Close()
 		if ld != nil {
 			ld.ResetConns()
@@ -843,10 +968,23 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	if !ok {
 		return
 	}
-	bm.Reset()
 	if users == nil {
 		users = currentUsers
 	}
+	// Cancel must reach existing connections, not just new ones.
+	// xray-core's dispatcher wraps each connection's writer in a
+	// RateLimitWriter holding the limiter pointer fetched from this
+	// manager at dispatch time, so deleting or replacing the manager
+	// entry alone leaves live connections throttled on the old bucket.
+	// Retire the manager's CURRENT entry in place before Reset() wipes
+	// it: this unlimits live connections even when their bucket is not
+	// the shared SpeedTracker bucket — e.g. buckets created by the
+	// fn == nil fallback below (SetUserLimit), or a bucket the manager
+	// still holds after SpeedTracker replaced its own. For the normal
+	// shared-bucket case this is a harmless no-op: the service layer
+	// already retired the same bucket in place.
+	retireCancelledLimiters(bm, users)
+	bm.Reset()
 	for _, u := range users {
 		email := userEmail(u.ID)
 		if fn != nil {
@@ -858,15 +996,42 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	}
 }
 
+// unlimitedBurst mirrors limiter.retireBucket: the burst of a retired
+// bucket. The rate itself is rate.Inf, so no token wait is ever imposed.
+const unlimitedBurst = 1 << 30
+
+// retireCancelledLimiters retires in place the bandwidth manager's current
+// limiter for every user whose new ledger entry carries no speed limit.
+// It must run before the manager is Reset: after Reset the old entries
+// are unreachable, but live connections still hold pointers to them.
+func retireCancelledLimiters(bm featurebandwidth.Manager, users []model.UserSpec) {
+	if bm == nil {
+		return
+	}
+	for _, u := range users {
+		if u.SpeedLimit > 0 {
+			continue
+		}
+		if lim := bm.GetUserLimiter(userEmail(u.ID)); lim != nil {
+			lim.SetLimit(rate.Inf)
+			lim.SetBurst(unlimitedBurst)
+		}
+	}
+}
+
 // updateDispatcherLimits configures the LimitDispatcher with per-user
 // device-limit admission metadata only. Speed limits are enforced by the
 // patched xray-core bandwidth feature.
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
+	rejectedFn := x.deviceLimitRejectedFunc
 	x.mu.Unlock()
 	if ld == nil {
 		return
+	}
+	if rejectedFn != nil {
+		ld.SetDeviceLimitRejectedFunc(rejectedFn)
 	}
 
 	emailToUID := make(map[string]int, len(users)*2)

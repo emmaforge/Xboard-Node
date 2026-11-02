@@ -90,6 +90,15 @@ load_health_port_from_config() {
         else
             HEALTH_ENABLED=1
         fi
+    else
+        # The config exists but declares no health port: the running
+        # service has no health endpoint, so checking the installer's
+        # default port would fail spuriously. Treat it as disabled
+        # rather than probing a port nothing listens on. (A missing
+        # config file leaves the defaults untouched, per the early
+        # return above.)
+        HEALTH_PORT=0
+        HEALTH_ENABLED=0
     fi
 }
 
@@ -201,7 +210,7 @@ usage() {
     --health-port       本地健康检查端口（默认：65530，0 表示禁用）
     --gomemlimit        运行时 GOMEMLIMIT，例如 256MiB
     --gogc              运行时 GOGC，例如 50
-    --force-reconfigure 即使模式或目标变了，也覆盖已有安装
+    --force-reconfigure 覆盖已有安装：仅保留新绑定，旧配置先备份再替换（不加则合并）
     --purge             配合 uninstall，同时删除 /etc/xboard-node
     --yes, -y           对破坏性操作做非交互确认
 
@@ -220,8 +229,18 @@ usage() {
 HELP
 }
 
+# need_arg <flag>: every valued option must be followed by a value.
+# With `set -u`, reading a missing $2 used to die with a cryptic
+# "unbound variable" error; now the user gets a friendly message.
+need_arg() {
+    if [ "$#" -lt 2 ]; then
+        log_error "参数 $1 缺少值：请写成 $1 <值>"
+        usage
+        exit 1
+    fi
+}
+
 parse_args() {
-    local positional=()
     while [ $# -gt 0 ]; do
         case "$1" in
             install|upgrade|uninstall|status|help)
@@ -229,54 +248,67 @@ parse_args() {
                 shift
                 ;;
             --mode)
+                need_arg "$@"
                 MODE="$2"
                 shift 2
                 ;;
             --panel|-a|--api)
+                need_arg "$@"
                 PANEL_URL="$2"
                 shift 2
                 ;;
             --token|-t)
+                need_arg "$@"
                 TOKEN="$2"
                 shift 2
                 ;;
             --node-id|-n)
+                need_arg "$@"
                 NODE_ID="$2"
                 shift 2
                 ;;
             --node-type|-T)
+                need_arg "$@"
                 NODE_TYPE="$2"
                 shift 2
                 ;;
             --machine-id)
+                need_arg "$@"
                 MACHINE_ID="$2"
                 shift 2
                 ;;
             --kernel|-k)
+                need_arg "$@"
                 KERNEL_TYPE="$2"
                 shift 2
                 ;;
             --version)
+                need_arg "$@"
                 RELEASE_VERSION="$2"
                 shift 2
                 ;;
             --binary)
+                need_arg "$@"
                 BINARY_SOURCE="$2"
                 shift 2
                 ;;
             --xbctl-binary)
+                need_arg "$@"
                 CLI_BINARY_SOURCE="$2"
                 shift 2
                 ;;
             --health-port)
+                need_arg "$@"
                 HEALTH_PORT="$2"
                 shift 2
                 ;;
             --gomemlimit)
+                need_arg "$@"
                 RUNTIME_GOMEMLIMIT="$2"
                 shift 2
                 ;;
             --gogc)
+                need_arg "$@"
                 RUNTIME_GOGC="$2"
                 shift 2
                 ;;
@@ -297,15 +329,16 @@ parse_args() {
                 shift
                 ;;
             *)
-                positional+=("$1")
-                shift
+                # Unknown arguments used to be silently ignored (or,
+                # for a lone positional, quietly reinterpreted as the
+                # action). Fail loudly instead so a typo can't pass
+                # unnoticed.
+                log_error "未知参数：$1"
+                usage
+                exit 1
                 ;;
         esac
     done
-
-    if [ ${#positional[@]} -gt 0 ] && [ "$ACTION" = "install" ]; then
-        ACTION="${positional[0]}"
-    fi
 
     case "$KERNEL_TYPE" in
         singbox|SingBox|SINGBOX) KERNEL_TYPE="singbox" ;;
@@ -390,17 +423,44 @@ run_with_retry() {
     return 1
 }
 
+# required_tools_present: the tools the installer actually needs
+# (curl/wget for downloads). ca-certificates has no binary to probe,
+# so it is not part of this check.
+required_tools_present() {
+    command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1
+}
+
 install_dependencies() {
     case "$OS" in
         ubuntu|debian)
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1
+            if ! { DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq &&
+                   DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1; }; then
+                # Previously any apt failure was fatal (set -e), even
+                # when curl/wget were already installed and nothing
+                # else was needed. Now apt failure is only a warning
+                # when the required tools are present; it is fatal
+                # only when a required tool is actually missing.
+                if required_tools_present; then
+                    log_warn "安装依赖失败（apt），但 curl/wget 已齐全，继续安装"
+                else
+                    log_error "安装依赖失败（apt），且缺少必需工具 curl/wget，无法继续"
+                    exit 1
+                fi
+            fi
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf >/dev/null 2>&1; then
-                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates >/dev/null 2>&1
+                install_ok=$(run_with_retry 5 3 dnf install -y -q curl wget ca-certificates >/dev/null 2>&1 && echo yes || echo no)
             else
-                run_with_retry 5 3 yum install -y -q curl wget ca-certificates >/dev/null 2>&1
+                install_ok=$(run_with_retry 5 3 yum install -y -q curl wget ca-certificates >/dev/null 2>&1 && echo yes || echo no)
+            fi
+            if [ "$install_ok" != "yes" ]; then
+                if required_tools_present; then
+                    log_warn "安装依赖失败（包管理器），但 curl/wget 已齐全，继续安装"
+                else
+                    log_error "安装依赖失败（包管理器），且缺少必需工具 curl/wget，无法继续"
+                    exit 1
+                fi
             fi
             ;;
         *)
@@ -496,10 +556,6 @@ detect_current_state() {
     fi
 }
 
-require_reconfigure_confirmation() {
-    return
-}
-
 select_binary_source() {
     # Only an explicitly requested local binary (--binary) is ever used.
     # Previously, a same-named file in the current working directory
@@ -558,20 +614,29 @@ resolve_download_url() {
 # When the requested version is "latest" but the fork has no version tag
 # yet, GitHub's /latest endpoint 404s (CI only marks tag releases as
 # latest; dev pushes publish under the "dev" tag with make_latest=false).
-# In that case fall back to the dev release with an explicit warning,
-# instead of failing an otherwise working fork install. A version tag
-# still has to be pushed for "latest" to point at a stable release.
+# Only that 404 falls back to the dev release, with an explicit warning.
+# Any other failure (network outage, 5xx, ...) must NOT silently install
+# dev: previously every curl failure fell back, so a transient network
+# blip installed an unintended dev binary. The HTTP status is probed
+# with a second lightweight request; a probe that itself fails (000)
+# is treated as a network failure, not a 404.
 download_artifact() {
     local url="$1" out="$2" artifact="$3"
     if curl -fsSL "$url" -o "$out"; then
         return 0
     fi
     if [ "$RELEASE_VERSION" = "latest" ]; then
-        local dev_url="${DEFAULT_DOWNLOAD_BASE}/download/dev/${artifact}"
-        log_warn "未找到最新正式版，回退到 dev 版：${dev_url}"
-        if curl -fsSL "$dev_url" -o "$out"; then
-            DOWNLOAD_URL="$dev_url"
-            return 0
+        local http_code
+        http_code=$(curl -sL -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+        if [ "$http_code" = "404" ]; then
+            local dev_url="${DEFAULT_DOWNLOAD_BASE}/download/dev/${artifact}"
+            log_warn "未找到最新正式版（404），回退到 dev 版：${dev_url}"
+            if curl -fsSL "$dev_url" -o "$out"; then
+                DOWNLOAD_URL="$dev_url"
+                return 0
+            fi
+        else
+            log_error "下载失败（HTTP ${http_code}），不是 404，不回退到 dev 版"
         fi
     fi
     DOWNLOAD_URL="$url"
@@ -647,11 +712,21 @@ render_config() {
         --meta "$TMP_DIR/install-meta.json"
         --install-root "$INSTALL_ROOT"
     )
-    if [ -f "$CONFIG_FILE" ]; then
-        init_args+=(--config "$CONFIG_FILE")
-    fi
-    if [ -f "$CREDENTIALS_FILE" ]; then
-        init_args+=(--credentials-in "$CREDENTIALS_FILE")
+    # --force-reconfigure is real overwrite semantics, not a no-op:
+    # the new binding replaces the whole previous config (and its
+    # credentials) instead of merging into it. The previous state is
+    # still backed up by backup_existing_state before it is replaced.
+    # Without the flag, render_config merges (same-ID rebind preserves
+    # customisation, other instances are kept).
+    if [ "$FORCE_RECONFIGURE" -eq 1 ]; then
+        log_warn "已启用 --force-reconfigure：已有配置将被新绑定完全替换（旧配置已备份）"
+    else
+        if [ -f "$CONFIG_FILE" ]; then
+            init_args+=(--config "$CONFIG_FILE")
+        fi
+        if [ -f "$CREDENTIALS_FILE" ]; then
+            init_args+=(--credentials-in "$CREDENTIALS_FILE")
+        fi
     fi
     if [ "$MODE" = "machine" ]; then
         init_args+=(--machine-id "$MACHINE_ID")
@@ -797,7 +872,15 @@ start_service() {
 # or starting the service. Replacing a running executable via install(1)
 # is safe (the running process keeps the old inode); the new binary takes
 # effect on the next service restart (e.g. after menu binding).
+# Enable semantics: only enable the service when it was already enabled
+# or when this is a fresh install (no unit file existed). A pre-existing
+# service that was deliberately left disabled must NOT be silently
+# enabled by a bare reinstall overwriting it.
 install_staged_binaries_only() {
+    local had_service=0 was_enabled=0 was_active=0
+    [ -f "$SERVICE_PATH" ] && had_service=1
+    systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1 && was_enabled=1
+    systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1 && was_active=1
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
@@ -806,7 +889,16 @@ install_staged_binaries_only() {
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    if [ "$was_enabled" -eq 1 ] || [ "$had_service" -eq 0 ]; then
+        systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+        BARE_INSTALL_ENABLED=1
+    else
+        log_warn "服务原本未设为开机自启，本次裸安装不擅自 enable，仍保持 disabled"
+        BARE_INSTALL_ENABLED=0
+    fi
+    if [ "$was_active" -eq 1 ]; then
+        log_warn "服务正在运行：新二进制将在下次重启服务后生效，本次裸安装不重启服务"
+    fi
 }
 
 # perform_install_only: install binaries + xbctl + service unit only, no
@@ -829,7 +921,11 @@ perform_install_only() {
     if [ -f "$CONFIG_FILE" ]; then
         log_info "已有配置已保留：${CONFIG_FILE}"
     fi
-    log_info "服务单元已安装并设为开机自启：${SERVICE_NAME}（本次仅安装，不启动服务）"
+    if [ "${BARE_INSTALL_ENABLED:-1}" -eq 1 ]; then
+        log_info "服务单元已安装并设为开机自启：${SERVICE_NAME}（本次仅安装，不启动服务）"
+    else
+        log_info "服务单元已安装（开机自启状态保持不变：仍为 disabled，本次仅安装，不启动服务）"
+    fi
     log_info "请运行不带参数的 xbctl 打开中文交互菜单：xbctl"
     log_info "在菜单里选 1 绑定节点，或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID"
     log_info "绑定完成后服务会自动重启"
@@ -843,7 +939,6 @@ perform_install() {
         return
     fi
     detect_current_state
-    require_reconfigure_confirmation
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
@@ -871,6 +966,14 @@ perform_upgrade() {
         perform_install
         return
     fi
+    # Read the health port from the existing config BEFORE the
+    # post-upgrade health check: previously the check always used the
+    # installer's default port (65530), so an install bound with a
+    # different port — or with health checks disabled — failed the
+    # upgrade (and rolled back) even though the service was healthy.
+    # wait_for_health already returns success when HEALTH_ENABLED=0,
+    # so a disabled check no longer fails the upgrade.
+    load_health_port_from_config "$CONFIG_FILE"
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
@@ -915,10 +1018,36 @@ confirm_uninstall() {
     fi
 }
 
+# wait_for_service_stopped: poll systemctl until the service is no
+# longer active (up to ~10s). A stop command returning success does
+# not prove the process is gone; deleting binaries while it still runs
+# would leave a half-removed deployment behind.
+wait_for_service_stopped() {
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
 perform_uninstall() {
     confirm_uninstall
     if [ -f "$SERVICE_PATH" ]; then
         systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        # Verify the service really stopped BEFORE deleting anything:
+        # if it is still active, abort the uninstall rather than
+        # removing binaries out from under a running service.
+        if ! wait_for_service_stopped; then
+            log_error "服务停止失败：${SERVICE_NAME} 仍在运行，卸载已中止，未删除任何文件"
+            exit 1
+        fi
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
         rm -f "$SERVICE_PATH"
         systemctl daemon-reload || true

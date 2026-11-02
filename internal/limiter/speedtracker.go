@@ -2,7 +2,6 @@ package limiter
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
@@ -21,12 +20,29 @@ type SpeedTracker struct {
 	buckets map[int]*rate.Limiter // userID → shared rate limiter
 	uuidMap map[string]int        // UUID → userID
 
-	// Fast-path: when no users have a speed limit, GetLimiter returns nil
-	// immediately without any map lookup.
-	hasLimits atomic.Bool
-
 	// Optional callback for logging
 	logFunc SpeedTrackerLogCallback
+}
+
+// unlimitedBurst is the burst of a retired bucket (see retireBucket). It
+// only defeats the per-call truncation in kernel connection wrappers;
+// the rate itself is rate.Inf, so no token wait is ever imposed.
+const unlimitedBurst = 1 << 30
+
+// retireBucket converts a shared bucket to unlimited IN PLACE. Connections
+// that already hold the *rate.Limiter pointer keep sharing it, so flipping
+// the limit here unlimits them immediately — deleting the map entry alone
+// would leave existing holders throttled until they disconnect, because
+// they never re-read the map. The retired bucket stays in the map (for
+// still-active users) so later GetLimiter calls return the same unlimited
+// bucket; it is deleted by the removed-user cleanup once the user leaves,
+// and re-armed by UpdateBuckets/GetLimiter if a limit is configured again.
+func retireBucket(lim *rate.Limiter) {
+	if lim == nil {
+		return
+	}
+	lim.SetLimit(rate.Inf)
+	lim.SetBurst(unlimitedBurst)
 }
 
 // burstFor computes the token-bucket burst for a bytes-per-second rate:
@@ -85,19 +101,25 @@ func (t *SpeedTracker) UpdateBuckets() {
 				newUUIDMap[user.UUID] = user.ID
 			}
 
-			// Update existing limiter if speed changed
+			// Update existing limiter if speed changed. A cancelled
+			// limit (SpeedLimit <= 0) retires the bucket in place
+			// instead of deleting it, so connections that already
+			// hold the shared pointer stop being throttled at once
+			// (see retireBucket); only fully removed users lose
+			// their map entry, in the cleanup loop below.
 			if lim, ok := t.buckets[user.ID]; ok {
 				if user.SpeedLimit > 0 {
 					bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
 					lim.SetLimit(rate.Limit(bytesPerSec))
 					lim.SetBurst(burstFor(bytesPerSec))
 				} else {
-					delete(t.buckets, user.ID)
+					retireBucket(lim)
 				}
 			}
 		}
 
-		// Clean up buckets for removed users
+		// Clean up buckets for removed users (retired buckets of
+		// still-active users are kept deliberately, see above).
 		for id := range t.buckets {
 			if _, ok := activeIDs[id]; !ok {
 				delete(t.buckets, id)
@@ -105,7 +127,6 @@ func (t *SpeedTracker) UpdateBuckets() {
 		}
 
 		t.uuidMap = newUUIDMap
-		t.hasLimits.Store(len(t.buckets) > 0)
 	}()
 
 	if t.logFunc != nil {
@@ -129,7 +150,7 @@ func (t *SpeedTracker) GetLimiter(user string) *rate.Limiter {
 	}
 	t.mu.RUnlock()
 
-	// Get user info from limiter
+	// Get user info from limiter (first check; revalidated below).
 	t.limiter.mu.RLock()
 	u, userExists := t.limiter.users[uid]
 	t.limiter.mu.RUnlock()
@@ -138,31 +159,88 @@ func (t *SpeedTracker) GetLimiter(user string) *rate.Limiter {
 		return nil
 	}
 
-	// Create limiter on-demand (same burst rule as UpdateBuckets).
-	bytesPerSec := int(u.SpeedLimit) * 1_000_000 / 8
-	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burstFor(bytesPerSec))
-
 	t.mu.Lock()
-	// Double-check after acquiring write lock
+	defer t.mu.Unlock()
+
+	// Double-check after acquiring the write lock: the UUID→userID
+	// mapping and the user's configured limit may both have changed
+	// while we waited (UUID reassigned to another user, user removed,
+	// or limit cancelled). Checking only "bucket exists" here used to
+	// return a stale bucket belonging to the wrong user or to a
+	// limit that no longer exists. Lock-order note: Limiter.mu is a
+	// leaf lock — no code holds it while acquiring SpeedTracker.mu
+	// (UpdateBuckets releases it before taking t.mu) — so taking it
+	// under t.mu here cannot deadlock against UpdateBuckets.
+	currentUID, mapped := t.uuidMap[user]
+	if !mapped {
+		return nil
+	}
+	if currentUID != uid {
+		uid = currentUID
+	}
+	t.limiter.mu.RLock()
+	current, currentExists := t.limiter.users[uid]
+	t.limiter.mu.RUnlock()
+	if !currentExists || current.UUID != user {
+		// UUID now belongs to nobody, or to a different record than
+		// the mapping claims: never hand out a bucket for it. (The
+		// bucket itself is left alone — it is keyed by user ID and
+		// is unreachable via this UUID; UpdateBuckets deletes
+		// buckets of users that are actually gone.)
+		return nil
+	}
+	if current.SpeedLimit <= 0 {
+		// Limit cancelled while we waited: retire any existing
+		// bucket in place (existing holders stop being throttled)
+		// and report unlimited for this lookup.
+		if existing, ok := t.buckets[uid]; ok {
+			retireBucket(existing)
+			return existing
+		}
+		return nil
+	}
+
+	// Re-sync an existing bucket to the current config (covers a
+	// retired bucket whose limit was re-imposed, and a bucket created
+	// concurrently by another goroutine), or create it on demand
+	// with the same burst rule as UpdateBuckets.
+	bytesPerSec := int(current.SpeedLimit) * 1_000_000 / 8
 	if existing, ok := t.buckets[uid]; ok {
-		t.mu.Unlock()
+		existing.SetLimit(rate.Limit(bytesPerSec))
+		existing.SetBurst(burstFor(bytesPerSec))
 		return existing
 	}
+	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burstFor(bytesPerSec))
 	t.buckets[uid] = lim
-	t.hasLimits.Store(true)
-	t.mu.Unlock()
-
 	return lim
 }
 
 // HasLimits returns true if any user currently has a speed limit configured.
 func (t *SpeedTracker) HasLimits() bool {
-	return t.hasLimits.Load()
+	return t.LimitedUserCount() > 0
 }
 
-// LimitedUserCount returns the number of users with active speed limits.
+// LimitedUserCount returns the number of users CONFIGURED with a speed
+// limit (SpeedLimit > 0 in the limiter's user set), whether or not a
+// token bucket has been materialised for them yet. It used to return
+// len(buckets), which only counted users that had already opened a
+// connection (buckets are created on demand), so the panel-facing
+// "limited_users" / "speed_limited_users" fields under-reported
+// configured limits. Retired (unlimited) buckets of still-active users
+// are not counted, because their users no longer have a limit.
 func (t *SpeedTracker) LimitedUserCount() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return len(t.buckets)
+	if t.limiter == nil {
+		t.mu.RLock()
+		defer t.mu.RUnlock()
+		return len(t.buckets)
+	}
+	t.limiter.mu.RLock()
+	defer t.limiter.mu.RUnlock()
+	n := 0
+	for _, u := range t.limiter.users {
+		if u.SpeedLimit > 0 {
+			n++
+		}
+	}
+	return n
 }

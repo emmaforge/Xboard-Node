@@ -16,7 +16,11 @@ import (
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+// buildConfig returns an error for configurations that cannot yield a
+// working inbound (e.g. hysteria v1, see buildHysteria) instead of
+// silently producing a config with no inbound that would "start
+// successfully" while accepting no connections.
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) (M, error) {
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -68,7 +72,10 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, tc)
+	inbound, err := buildInbound(nc, users, tc)
+	if err != nil {
+		return nil, err
+	}
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	} else {
@@ -81,7 +88,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
 	mergeCustomXray(cfg, kcfg)
-	return cfg
+	return cfg, nil
 }
 
 // outboundConfigToXray converts a structured OutboundConfig (from the panel)
@@ -197,7 +204,7 @@ func xrayLogLevel(singboxLevel string) string {
 	}
 }
 
-func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) (M, error) {
 	listenAddr := "::"
 	if nc.ListenIP != "" {
 		listenAddr = nc.ListenIP
@@ -216,21 +223,27 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 
 	switch nc.Protocol {
 	case "vmess":
-		return buildVMess(base, nc, users, tc)
+		return buildVMess(base, nc, users, tc), nil
 	case "vless":
-		return buildVLESS(base, nc, users, tc)
+		return buildVLESS(base, nc, users, tc), nil
 	case "trojan":
-		return buildTrojan(base, nc, users, tc)
+		return buildTrojan(base, nc, users, tc), nil
 	case "shadowsocks":
-		return buildShadowsocks(base, nc, users)
+		return buildShadowsocks(base, nc, users), nil
 	case "socks":
-		return buildSocks(base, users)
+		return buildSocks(base, users), nil
 	case "http":
-		return buildHTTP(base, nc, users, tc)
+		return buildHTTP(base, nc, users, tc), nil
 	case "hysteria":
 		return buildHysteria(base, nc, users, tc)
+	case "hysteria2":
+		// Mirror the sing-box kernel: the literal protocol name selects
+		// v2 regardless of the panel's Version field.
+		nc2 := *nc
+		nc2.Version = 2
+		return buildHysteria(base, &nc2, users, tc)
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
@@ -296,10 +309,14 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	// Trojan requires TLS or Reality to be enabled.
 	// If the panel didn't explicitly set TLS=1 or TLS=2, but we have certs,
 	// we should enable a default TLS config to ensure the inbound can start.
+	// This must NOT mutate the caller's *NodeSpec (the old code set
+	// nc.TLS = 1 on the shared spec, leaking the forced value into later
+	// builds and hash computations): work on a local copy instead.
 	ss, _ := base["streamSettings"].(M)
 	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
-		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
-		applyStreamSettings(base, nc, tc)
+		ncCopy := *nc
+		ncCopy.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
+		applyStreamSettings(base, &ncCopy, tc)
 	}
 
 	return base
@@ -401,10 +418,12 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLS
 }
 
 // buildHysteria creates a Hysteria v2 inbound for xray-core.
-func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) (M, error) {
 	if nc.Version != 2 {
-		nlog.Core().Warn("xray: only supports hysteria v2, skipping v1 inbound")
-		return nil
+		// Hysteria v1 must fail loudly: the old Warn + nil return let
+		// buildConfig produce a config with no inbound, and Start then
+		// reported success for a node accepting no connections.
+		return nil, fmt.Errorf("xray: hysteria v1 is not supported, use hysteria v2 (Version=2)")
 	}
 
 	clients := make([]M, 0, len(users))
@@ -456,7 +475,7 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 	}
 
 	base["streamSettings"] = ss
-	return base
+	return base, nil
 }
 
 func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
@@ -484,8 +503,21 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 					}
 				}
 			}
+			// WS host priority, unified with the sing-box kernel: an
+			// explicit Host header wins over the host field; the host
+			// field only fills in a missing Host. (Previously the host
+			// field unconditionally overwrote headers' Host.)
 			if v, ok := nc.NetworkSettings["host"]; ok {
-				headers["Host"] = v
+				hasHostKey := false
+				for k := range headers {
+					if strings.EqualFold(k, "Host") {
+						hasHostKey = true
+						break
+					}
+				}
+				if !hasHostKey {
+					headers["Host"] = v
+				}
 			}
 			if len(headers) > 0 {
 				wsSettings["headers"] = headers
@@ -648,19 +680,16 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any) M {
 	var xrayRules []M
 
-	// Structured custom routes now take the highest priority for panel-managed overrides.
-	for _, rule := range customRouteRules {
-		if rule.Disabled {
-			continue
-		}
-		xrayRules = append(xrayRules, compileCustomRouteRule(rule)...)
-	}
-
-	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
-	for _, cr := range customRules {
-		xrayRules = append(xrayRules, M(cr))
-	}
-
+	// Private-segment block FIRST, ahead of structured, raw, and panel
+	// rules alike. Xray matches the first rule, so any rule placed
+	// before this block could route private traffic to a proxy and
+	// bypass the SSRF block (the sing-box B16 issue). Policy choice,
+	// stated explicitly: a structured custom rule that covers a private
+	// CIDR is shadowed by this block rather than explicitly rejected —
+	// buildRouting has no error channel to reject with, and blocking
+	// private destinations is the safe outcome either way. This is
+	// stricter than sing-box, where validated structured rules keep
+	// priority above the private blocks.
 	xrayRules = append(xrayRules, M{
 		"type": "field",
 		"ip": []string{
@@ -678,6 +707,20 @@ func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteR
 		},
 		"outboundTag": "block",
 	})
+
+	// Structured custom routes (panel-managed) come next.
+	for _, rule := range customRouteRules {
+		if rule.Disabled {
+			continue
+		}
+		xrayRules = append(xrayRules, compileCustomRouteRule(rule)...)
+	}
+
+	// Raw custom routes remain the escape hatch, but no longer outrank
+	// the private block or structured rules.
+	for _, cr := range customRules {
+		xrayRules = append(xrayRules, M(cr))
+	}
 
 	for _, rule := range rules {
 		xrayRules = append(xrayRules, compilePanelRouteRule(rule)...)
@@ -716,6 +759,19 @@ func compilePanelRouteRule(rule model.RouteRule) []M {
 	case "proxy":
 		action.Type = "route"
 		action.Target = rule.ActionValue
+	case "dns":
+		// Handle dns explicitly instead of falling through to block:
+		// an explicit target routes there; without one, route direct
+		// (DNS traffic is not proxied by default) and log it, mirroring
+		// the sing-box kernel's dns fallback so both kernels agree.
+		// There is no panel-defined dns outbound to reference.
+		if rule.ActionValue != "" {
+			action.Type = "route"
+			action.Target = rule.ActionValue
+		} else {
+			nlog.Core().Warn("xray: panel dns route without a target, routing direct")
+			action.Type = "direct"
+		}
 	}
 	return compileCustomRouteRule(model.CustomRouteRule{Match: match, Action: action})
 }

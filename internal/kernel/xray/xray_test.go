@@ -162,7 +162,6 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
@@ -176,7 +175,6 @@ func TestXrayCapabilities(t *testing.T) {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -192,7 +190,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -216,7 +213,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -232,6 +228,71 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	}
 }
 
+func TestXrayUpdateBandwidthLimitsCancelRetiresLiveConnections(t *testing.T) {
+	// Call-site test for speed-limit cancel: a live connection's
+	// RateLimitWriter holds the limiter pointer fetched from the
+	// manager at dispatch time. Cancelling the limit must retire
+	// THAT pointer in place — deleting/replacing the manager entry
+	// alone would leave the live connection throttled forever.
+	// Scenario A: fallback bucket (no speedLimitFunc wired, the
+	// SetUserLimit path) that SpeedTracker can never retire.
+	inst := new(xrayCore.Instance)
+	bm := featurebandwidth.New()
+	if err := inst.AddFeature(bm); err != nil {
+		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
+	}
+	x := New(config.KernelConfig{Type: "xray"})
+	x.instance = inst
+	x.updateBandwidthLimits([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1", SpeedLimit: 8},
+		{ID: 2, UUID: "uuid-2", SpeedLimit: 8},
+	})
+	heldFallback := bm.GetUserLimiter(userEmail(1))
+	heldLimited := bm.GetUserLimiter(userEmail(2))
+	if heldFallback == nil || heldLimited == nil {
+		t.Fatal("expected fallback limiters to be created")
+	}
+	x.updateBandwidthLimits([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1", SpeedLimit: 0},
+		{ID: 2, UUID: "uuid-2", SpeedLimit: 8},
+	})
+	if heldFallback.Limit() != rate.Inf {
+		t.Fatalf("cancelled fallback bucket limit = %v, want Inf", heldFallback.Limit())
+	}
+	if err := heldFallback.WaitN(context.Background(), 1<<30); err != nil {
+		t.Fatalf("cancelled fallback bucket WaitN error = %v, want immediate success", err)
+	}
+	if heldLimited.Limit() == rate.Inf {
+		t.Fatal("still-limited user's bucket must not be retired")
+	}
+
+	// Scenario B: the live connection's pointer is the manager's
+	// current entry, but the refill would delete it (service hands
+	// out no bucket for the cancelled user). The pointer itself must
+	// still be retired in place before Reset() wipes the entry.
+	inst2 := new(xrayCore.Instance)
+	bm2 := featurebandwidth.New()
+	if err := inst2.AddFeature(bm2); err != nil {
+		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
+	}
+	x2 := New(config.KernelConfig{Type: "xray"})
+	x2.instance = inst2
+	oldBucket := rate.NewLimiter(rate.Limit(5000), 5000)
+	bm2.SetUserLimiter(userEmail(1), oldBucket)
+	x2.SetSpeedLimitFunc(func(uuid string) *rate.Limiter {
+		// Simulate the service no longer handing out a bucket for
+		// this user (limit cancelled): refill deletes the entry.
+		return nil
+	})
+	// SetSpeedLimitFunc itself triggers a refill from x2.users (empty),
+	// which Reset() the manager — so re-seed the entry the live
+	// connection holds, then cancel via a ledger update.
+	bm2.SetUserLimiter(userEmail(1), oldBucket)
+	x2.updateBandwidthLimits([]model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 0}})
+	if oldBucket.Limit() != rate.Inf {
+		t.Fatalf("replaced bucket limit = %v, want Inf", oldBucket.Limit())
+	}
+}
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})

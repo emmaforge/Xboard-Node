@@ -81,6 +81,13 @@ type LimitDispatcher struct {
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
 
+	// deviceLimitRejectedFunc, when set, is called once per connection
+	// rejected by checkDeviceLimit. It lets the service layer count
+	// rejections (e.g. limiter.RecordDeviceLimitEvent) without the
+	// dispatcher depending on the service layer. It is invoked outside
+	// mu, and must itself be cheap and non-blocking.
+	deviceLimitRejectedFunc atomic.Pointer[func()]
+
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
 	unlimitedIPs sync.Map // email → *ipCounter
@@ -289,10 +296,78 @@ func (d *LimitDispatcher) Close() error {
 
 func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
 	d.mu.Lock()
+	oldLimits := d.deviceLimits
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
+	// Migrate live counts across the limited/unlimited buckets when a
+	// user's limit status flips. Without this, a limited -> unlimited
+	// switch stranded counts in limitedIPs (and vice versa): delConn
+	// looked in only one bucket, so the device slot leaked permanently
+	// and the user could be blocked forever despite connections having
+	// closed.
+	for email := range unionKeys(oldLimits, deviceLimits) {
+		wasLimited := oldLimits[email] > 0
+		nowLimited := deviceLimits[email] > 0
+		if wasLimited == nowLimited {
+			continue
+		}
+		if nowLimited {
+			// unlimited -> limited: fold the lock-free counters into
+			// the limited map and drop the unlimited entry.
+			if v, ok := d.unlimitedIPs.Load(email); ok {
+				ic := v.(*ipCounter)
+				moved := make(map[string]int)
+				ic.ips.Range(func(key, value interface{}) bool {
+					if n := value.(*atomic.Int64).Load(); n > 0 {
+						moved[key.(string)] = int(n)
+					}
+					return true
+				})
+				if len(moved) > 0 {
+					if d.limitedIPs == nil {
+						d.limitedIPs = make(map[string]map[string]int)
+					}
+					dst := d.limitedIPs[email]
+					if dst == nil {
+						dst = make(map[string]int)
+						d.limitedIPs[email] = dst
+					}
+					for ip, n := range moved {
+						dst[ip] += n
+					}
+				}
+				d.unlimitedIPs.Delete(email)
+			}
+		} else {
+			// limited -> unlimited: move the limited counts into the
+			// lock-free counters and drop the limited entry.
+			if ips, ok := d.limitedIPs[email]; ok {
+				v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+				ic := v.(*ipCounter)
+				for ip, n := range ips {
+					if n <= 0 {
+						continue
+					}
+					rv, _ := ic.ips.LoadOrStore(ip, &atomic.Int64{})
+					rv.(*atomic.Int64).Add(int64(n))
+				}
+				delete(d.limitedIPs, email)
+			}
+		}
+	}
 	d.mu.Unlock()
+}
 
+// unionKeys returns the set of keys present in either map.
+func unionKeys(a, b map[string]int) map[string]bool {
+	out := make(map[string]bool, len(a)+len(b))
+	for k := range a {
+		out[k] = true
+	}
+	for k := range b {
+		out[k] = true
+	}
+	return out
 }
 
 func (d *LimitDispatcher) ResetConns() {
@@ -316,14 +391,29 @@ func (d *LimitDispatcher) ResetConns() {
 // GetConnectionState returns dispatcher-tracked alive IPs and connection count.
 // Traffic bytes are intentionally left to xray's built-in stats pipeline.
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
+	// Deep-copy both maps under RLock, then iterate the copies without
+	// holding the lock. The previous code only copied the map headers
+	// and iterated limitedIPs after unlocking, racing with writers
+	// (checkDeviceLimit/delConn take mu.Lock) and crashing with
+	// "concurrent map iteration and map write".
 	d.mu.RLock()
-	emailToUID := d.emailToUID
-	limitedIPs := d.limitedIPs
+	emailToUID := make(map[string]int, len(d.emailToUID))
+	for email, uid := range d.emailToUID {
+		emailToUID[email] = uid
+	}
+	limitedIPs := make(map[string]map[string]int, len(d.limitedIPs))
+	for email, ipsMap := range d.limitedIPs {
+		cp := make(map[string]int, len(ipsMap))
+		for ip, count := range ipsMap {
+			cp[ip] = count
+		}
+		limitedIPs[email] = cp
+	}
 	d.mu.RUnlock()
 
 	aliveIPs = make(map[int]map[string]bool)
 
-	// Collect IPs from limited users (under RLock snapshot).
+	// Collect IPs from limited users (from the deep copy above).
 	for email, ipsMap := range limitedIPs {
 		uid := emailToUID[email]
 		if uid == 0 {
@@ -425,59 +515,47 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 		return false
 	}
 
-	// Slow path: user has device limit — need deterministic ordering.
-	d.mu.RLock()
-	ips := d.limitedIPs[email]
-	if ips != nil && ips[sourceIP] > 0 {
-		d.mu.RUnlock()
-		d.mu.Lock()
-		d.limitedIPs[email][sourceIP]++
-		d.mu.Unlock()
-		return false
+	// Slow path: user has device limit — the whole decision is made
+	// under the write lock. The old code fast-allowed under RLock
+	// (merged count < limit) and then incremented under Lock without
+	// re-checking the merged count, so concurrent connections from
+	// new devices could all observe "under limit" and all be admitted.
+	// Taking the write lock for limited users only (unlimited users
+	// keep the lock-free path above) closes that window. The rejection
+	// callback fires outside mu, so a callback can never deadlock
+	// against a dispatcher lock.
+	rejected := d.checkDeviceLimitLocked(email, sourceIP, limit)
+	if rejected {
+		d.notifyDeviceLimitRejected()
 	}
+	return rejected
+}
 
-	// Fast-allow only when the merged local + cross-node device count is
-	// still under the limit. Using the local count alone here would let
-	// a new device through whenever this node alone was under the limit,
-	// defeating cross-node enforcement. Over-limit cases fall through to
-	// the deterministic write-lock check below (which also admits IPs
-	// already known globally).
-	if ips != nil {
-		globalIPs := d.globalIPsFor(email)
-		if globalIPs != nil && globalIPs[sourceIP] {
-			d.mu.RUnlock()
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-			return false
-		}
-		merged := len(ips)
-		if globalIPs != nil {
-			for ip := range globalIPs {
-				if ips[ip] == 0 {
-					merged++
-				}
-			}
-		}
-		if merged < limit {
-			d.mu.RUnlock()
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-			return false
-		}
+// SetDeviceLimitRejectedFunc configures the callback invoked once per
+// connection rejected by checkDeviceLimit. A nil fn clears the callback.
+func (d *LimitDispatcher) SetDeviceLimitRejectedFunc(fn func()) {
+	d.deviceLimitRejectedFunc.Store(&fn)
+}
+
+// notifyDeviceLimitRejected invokes the rejection callback, if set.
+// Callers must only invoke it on the rejection path, outside mu.
+func (d *LimitDispatcher) notifyDeviceLimitRejected() {
+	if p := d.deviceLimitRejectedFunc.Load(); p != nil && *p != nil {
+		(*p)()
 	}
-	d.mu.RUnlock()
+}
 
-	// Over limit — need write lock for deterministic check.
+// checkDeviceLimitLocked decides admission for a limited user while
+// holding mu (write). It returns true when the connection must be
+// rejected; the caller notifies outside the lock.
+func (d *LimitDispatcher) checkDeviceLimitLocked(email, sourceIP string, limit int) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Re-check under write lock.
-	ips = d.limitedIPs[email]
+	if d.limitedIPs == nil {
+		d.limitedIPs = make(map[string]map[string]int)
+	}
+	ips := d.limitedIPs[email]
 	if ips == nil {
 		ips = make(map[string]int)
 		d.limitedIPs[email] = ips
@@ -565,9 +643,13 @@ func (d *LimitDispatcher) globalIPsFor(email string) map[string]bool {
 	return d.globalDevices[email]
 }
 
-// delConn decrements the IP refcount when a connection closes.
+// delConn decrements the IP refcount when a connection closes. It
+// releases from BOTH buckets: UpdateLimits migrates counts on a limit
+// switch, but a connection admitted concurrently with a switch can still
+// leave a count in the other bucket, and the old single-bucket lookup
+// leaked that device slot permanently.
 func (d *LimitDispatcher) delConn(email, sourceIP string) {
-	// Check if this is an unlimited user first (lock-free).
+	// Unlimited bucket (lock-free).
 	if v, ok := d.unlimitedIPs.Load(email); ok {
 		ic := v.(*ipCounter)
 		if rv, ok := ic.ips.Load(sourceIP); ok {
@@ -576,10 +658,9 @@ func (d *LimitDispatcher) delConn(email, sourceIP string) {
 				ic.ips.Delete(sourceIP)
 			}
 		}
-		return
 	}
 
-	// Limited user — use write lock.
+	// Limited bucket — use write lock.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if ips, ok := d.limitedIPs[email]; ok {

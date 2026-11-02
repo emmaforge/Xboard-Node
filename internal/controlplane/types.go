@@ -62,7 +62,7 @@ type ReportPayload struct {
 type PushClient interface {
 	Run(ctx context.Context)
 	IsConnected() bool
-	SendDeviceReport(devices map[int][]string)
+	SendDeviceReport(devices map[int][]string) error
 }
 
 type Source interface {

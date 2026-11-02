@@ -82,3 +82,20 @@ func (l *Limiter) GetDeviceLimitByUUID(uuid string) (int, bool) {
 	limit, ok := l.uuidDeviceLimit[uuid]
 	return limit, ok
 }
+
+// RecordDeviceLimitEvent records one connection rejected by a kernel
+// device-limit gate, feeding SnapshotMetrics().DeviceLimitEvents (reported
+// to the panel as limits.device_limit_events).
+//
+// This is the counting entry point kernels must call on rejection: the
+// lookup above (GetDeviceLimitByUUID) only tells the kernel what the limit
+// is, it cannot observe the kernel's accept/reject decision, so without a
+// call here the counter stays at 0 forever. Wiring the kernel side (a new
+// rejection callback on the Kernel interface, invoked from sing-box
+// ConnTracker.RoutedConnection/RoutedPacketConnection and xray
+// LimitDispatcher.checkDeviceLimit's reject paths) is a kernel-package
+// change and is deliberately NOT done here; until it lands, the counter
+// only moves when a kernel (or test) calls this method.
+func (l *Limiter) RecordDeviceLimitEvent() {
+	l.deviceLimitEvents.Add(1)
+}
