@@ -1,4 +1,4 @@
-// 中文交互菜单：不带参数运行 xbctl（或运行 xbctl menu）时打开。
+// 中文交互菜单：不带参数运行 xbnode（或运行 xbnode menu）时打开。
 //
 // 设计原则：
 //   - 菜单只做“收集输入 + 转交已有实现”，不另起一套重复逻辑。状态、
@@ -6,7 +6,7 @@
 //     已有的 runStatus / runList / runService / runBindAdd /
 //     runUpgrade / runUninstall；唯一例外是切换内核，原来没有对应的
 //     子命令，所以这里新加了 switchKernelAt，并同时注册为
-//     `xbctl kernel` 子命令，供菜单和命令行共同复用。
+//     `xbnode kernel` 子命令，供菜单和命令行共同复用。
 //   - 非交互环境（stdin 不是终端，或读到 EOF）绝不死等输入：
 //     run() 在入口处判断，菜单循环读到 EOF 也直接退出。
 //   - 面板 token 只做输入校验，确认页和日志里一律不回显原文。
@@ -41,7 +41,7 @@ func stdinIsTerminal() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-// runMenu 是 bare xbctl / xbctl menu 的入口：非终端直接打印中文
+// runMenu 是 bare xbnode / xbnode menu 的入口：非终端直接打印中文
 // 提示后退出，终端则进入交互循环。
 func runMenu() error {
 	if !stdinIsTerminal() {
@@ -54,10 +54,10 @@ func runMenu() error {
 // printMenuNonInteractiveHint 用于非交互环境：不读输入，只告诉用户
 // 怎么用交互菜单和各子命令。
 func printMenuNonInteractiveHint() {
-	fmt.Println("xbctl 交互菜单需要终端。")
-	fmt.Println("请在终端里直接运行 xbctl（不带参数）打开中文交互菜单，")
-	fmt.Println("或使用子命令，例如：xbctl status、xbctl list、xbctl service restart、xbctl bind-node、xbctl upgrade。")
-	fmt.Println("运行 xbctl help 查看全部子命令。")
+	fmt.Println("xbnode 交互菜单需要终端。")
+	fmt.Println("请在终端里直接运行 xbnode（不带参数）打开中文交互菜单，")
+	fmt.Println("或使用子命令，例如：xbnode status、xbnode list、xbnode service restart、xbnode bind-node、xbnode upgrade。")
+	fmt.Println("运行 xbnode help 查看全部子命令。")
 }
 
 func printMenu(out io.Writer) {
@@ -75,7 +75,7 @@ func printMenu(out io.Writer) {
 	fmt.Fprintln(out, "  6. 查看服务状态        服务、健康检查与实例一览")
 	fmt.Fprintln(out, "  7. 查看实例列表        列出已绑定的节点/机器实例")
 	fmt.Fprintln(out, "  8. 查看实时日志        跟随输出服务日志，按 Ctrl+C 退出（将结束菜单程序）")
-	fmt.Fprintln(out, "  9. 查看版本            显示 xbctl 版本")
+	fmt.Fprintln(out, "  9. 查看版本            显示 xbnode 版本")
 	fmt.Fprintln(out, "  10. 切换内核           在 sing-box 与 xray 之间切换（需确认并重启）")
 	fmt.Fprintln(out, "  11. 更新到最新版       从发布页下载最新版并替换二进制（需确认）")
 	fmt.Fprintln(out, "  12. 卸载              停止并删除服务与二进制，可选清除配置（需确认）")
@@ -150,7 +150,7 @@ func runMenuLoop(in *bufio.Reader, out io.Writer) error {
 			}
 		case "8":
 			// Honest wording: this process installs no SIGINT
-			// handler, so Ctrl+C kills xbctl itself instead of
+			// handler, so Ctrl+C kills xbnode itself instead of
 			// returning to the menu. The old "回到菜单" text
 			// promised behaviour the program never had.
 			fmt.Fprintln(out, "正在跟随服务日志，按 Ctrl+C 退出日志查看（将结束菜单程序）……")
@@ -353,7 +353,7 @@ func promptPanelAndToken(in *bufio.Reader, out io.Writer, tokenLabel string) (st
 	return panelURL, token, nil
 }
 
-// menuBindNode：安装/绑定节点，复用 runBindAdd（即 xbctl bind-node）。
+// menuBindNode：安装/绑定节点，复用 runBindAdd（即 xbnode bind-node）。
 func menuBindNode(in *bufio.Reader, out io.Writer) error {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return fmt.Errorf("不支持的架构 %s，仅支持 amd64/arm64", runtime.GOARCH)
@@ -392,7 +392,7 @@ func menuBindNode(in *bufio.Reader, out io.Writer) error {
 	return runBindAdd("node", args)
 }
 
-// menuBindMachine：绑定机器，复用 runBindAdd（即 xbctl bind-machine）。
+// menuBindMachine：绑定机器，复用 runBindAdd（即 xbnode bind-machine）。
 func menuBindMachine(in *bufio.Reader, out io.Writer) error {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return fmt.Errorf("不支持的架构 %s，仅支持 amd64/arm64", runtime.GOARCH)
@@ -422,7 +422,7 @@ func menuBindMachine(in *bufio.Reader, out io.Writer) error {
 	return runBindAdd("machine", []string{"--panel-url", panelURL, "--token", token, "--machine-id", fmt.Sprint(machineID), "--kernel", kernel})
 }
 
-// menuSwitchKernel：切换内核，复用 switchKernelAt（即 xbctl kernel）。
+// menuSwitchKernel：切换内核，复用 switchKernelAt（即 xbnode kernel）。
 func menuSwitchKernel(in *bufio.Reader, out io.Writer) error {
 	root, err := loadWritableRootConfig(defaultConfigPath)
 	if err != nil {
@@ -505,11 +505,11 @@ func menuUninstall(in *bufio.Reader, out io.Writer) error {
 	return runUninstall(args)
 }
 
-// runKernel 是 `xbctl kernel` 子命令：无参数列出各实例内核，
+// runKernel 是 `xbnode kernel` 子命令：无参数列出各实例内核，
 // 带参数切换指定实例的内核。
 //
-//	xbctl kernel
-//	xbctl kernel <instance-id> <singbox|xray>
+//	xbnode kernel
+//	xbnode kernel <instance-id> <singbox|xray>
 func runKernel(args []string) error {
 	if len(args) == 0 {
 		root, err := loadWritableRootConfig(defaultConfigPath)
@@ -530,7 +530,7 @@ func runKernel(args []string) error {
 		return nil
 	}
 	if len(args) != 2 {
-		return errors.New("usage: xbctl kernel <instance-id> <singbox|xray>")
+		return errors.New("usage: xbnode kernel <instance-id> <singbox|xray>")
 	}
 	if err := ensureRoot("kernel"); err != nil {
 		return err

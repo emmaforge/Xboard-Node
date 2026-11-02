@@ -21,11 +21,13 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
 	"github.com/cedar2025/xboard-node/internal/service"
+	versionpkg "github.com/cedar2025/xboard-node/internal/version"
 )
 
 var (
-	version   = "dev"
-	buildTime = "unknown"
+	// version is the release version from internal/version; it is no
+	// longer overwritten with a commit hash at build time.
+	version = versionpkg.Version
 )
 
 func main() {
@@ -34,7 +36,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)
+		fmt.Printf("xboard-node %s\n", version)
 		os.Exit(0)
 	}
 

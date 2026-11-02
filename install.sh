@@ -17,7 +17,7 @@ CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
 BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
-CLI_PATH="/usr/local/bin/xbctl"
+CLI_PATH="/usr/local/bin/xbnode"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 CLI_BINARY_SOURCE=""
 DEFAULT_HEALTH_PORT=65530
@@ -125,8 +125,8 @@ rollback_install() {
         else
             rm -f "$INSTALL_META"
         fi
-        if [ -f "$BACKUP_PATH/xbctl" ]; then
-            install -m 755 "$BACKUP_PATH/xbctl" "$CLI_PATH"
+        if [ -f "$BACKUP_PATH/xbnode" ]; then
+            install -m 755 "$BACKUP_PATH/xbnode" "$CLI_PATH"
         else
             rm -f "$CLI_PATH"
         fi
@@ -182,7 +182,7 @@ usage() {
   两种用法（二选一）：
     只安装不绑定（先装后配，像 V2bX 一样）：
       sudo bash install.sh
-      装完运行不带参数的 xbctl 打开中文交互菜单，选 1 绑定节点
+      装完运行不带参数的 xbnode 打开中文交互菜单，选 1 绑定节点
       或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID，
       绑定后服务会自动重启。
     安装时直接绑定：绑定信息必须一次给全，见下方必填项。
@@ -206,7 +206,7 @@ usage() {
     --kernel, -k        singbox 或 xray（默认：singbox）
     --version           发布版本或 latest（默认：latest）
     --binary            使用本地 xboard-node 二进制文件路径，不从网上下载
-    --xbctl-binary      使用本地 xbctl 二进制文件路径，不从网上下载
+    --xbnode-binary      使用本地 xbnode 二进制文件路径，不从网上下载
     --health-port       本地健康检查端口（默认：65530，0 表示禁用）
     --gomemlimit        运行时 GOMEMLIMIT，例如 256MiB
     --gogc              运行时 GOGC，例如 50
@@ -216,7 +216,7 @@ usage() {
 
   示例：
     sudo bash install.sh
-    xbctl
+    xbnode
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --node-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh upgrade
@@ -224,7 +224,7 @@ usage() {
 
   注意：绑定信息只给一部分（例如只给了面板地址、缺密钥或 ID）
   会直接报错退出，不会按一半信息安装；要么补齐绑定参数，
-  要么不带绑定参数只安装、装完用 xbctl 菜单绑定。
+  要么不带绑定参数只安装、装完用 xbnode 菜单绑定。
 
 HELP
 }
@@ -292,7 +292,7 @@ parse_args() {
                 BINARY_SOURCE="$2"
                 shift 2
                 ;;
-            --xbctl-binary)
+            --xbnode-binary)
                 need_arg "$@"
                 CLI_BINARY_SOURCE="$2"
                 shift 2
@@ -491,14 +491,14 @@ refuse_partial_binding() {
     log_error "绑定信息不完整：$1"
     log_error "正确用法（二选一）："
     log_error "  1) 补齐绑定参数后安装，例如：sudo bash install.sh --panel <面板地址> --token <密钥> --node-id <节点 ID>"
-    log_error "  2) 不带绑定参数只安装二进制，装完运行 xbctl 打开中文交互菜单绑定：sudo bash install.sh"
+    log_error "  2) 不带绑定参数只安装二进制，装完运行 xbnode 打开中文交互菜单绑定：sudo bash install.sh"
     exit 1
 }
 
 # validate_install_request classifies the install request into three cases
 # and sets INSTALL_ONLY accordingly:
 #   - no binding info at all (panel, token, node ID, machine ID all empty):
-#     install binaries only; binding happens later via the xbctl menu.
+#     install binaries only; binding happens later via the xbnode menu.
 #   - complete binding info for the selected mode: full install as before.
 #   - anything in between: refused via refuse_partial_binding.
 # Kernel and health-port are validated in all three cases.
@@ -666,34 +666,34 @@ stage_binary() {
     fi
 }
 
-stage_xbctl() {
-    local staged="$TMP_DIR/xbctl"
-    # Only an explicitly requested local binary (--xbctl-binary) is ever
-    # used; see select_binary_source for why implicit ./xbctl fallbacks
+stage_xbnode() {
+    local staged="$TMP_DIR/xbnode"
+    # Only an explicitly requested local binary (--xbnode-binary) is ever
+    # used; see select_binary_source for why implicit ./xbnode fallbacks
     # were removed.
     local local_src=""
     if [ -n "$CLI_BINARY_SOURCE" ]; then
         if [ ! -f "$CLI_BINARY_SOURCE" ]; then
-            log_error "未找到 xbctl 二进制文件来源：$CLI_BINARY_SOURCE"
+            log_error "未找到 xbnode 二进制文件来源：$CLI_BINARY_SOURCE"
             exit 1
         fi
         local_src="$CLI_BINARY_SOURCE"
     fi
     if [ -n "$local_src" ]; then
-        log_step "使用本地 xbctl 二进制文件：${local_src}"
+        log_step "使用本地 xbnode 二进制文件：${local_src}"
         cp "$local_src" "$staged"
     else
-        resolve_download_url "xbctl-linux-${ARCH}"
-        log_step "正在下载 xbctl：${DOWNLOAD_URL}"
-        if ! download_artifact "$DOWNLOAD_URL" "$staged" "xbctl-linux-${ARCH}"; then
-            log_error "从 ${DOWNLOAD_URL} 下载 xbctl 失败"
+        resolve_download_url "xbnode-linux-${ARCH}"
+        log_step "正在下载 xbnode：${DOWNLOAD_URL}"
+        if ! download_artifact "$DOWNLOAD_URL" "$staged" "xbnode-linux-${ARCH}"; then
+            log_error "从 ${DOWNLOAD_URL} 下载 xbnode 失败"
             exit 1
         fi
         verify_download "$DOWNLOAD_URL" "$staged"
     fi
     chmod +x "$staged"
     if ! "$staged" version > /dev/null 2>&1; then
-        log_error "下载的 xbctl 未通过版本检查"
+        log_error "下载的 xbnode 未通过版本检查"
         exit 1
     fi
 }
@@ -744,8 +744,8 @@ render_config() {
     fi
 
     local output
-    output=$("$TMP_DIR/xbctl" "${init_args[@]}") || {
-        log_error "xbctl config init 执行失败"
+    output=$("$TMP_DIR/xbnode" "${init_args[@]}") || {
+        log_error "xbnode config init 执行失败"
         exit 1
     }
 
@@ -785,7 +785,7 @@ backup_existing_state() {
         cp "$BINARY_PATH" "$BACKUP_PATH/xboard-node"
     fi
     if [ -x "$CLI_PATH" ]; then
-        cp "$CLI_PATH" "$BACKUP_PATH/xbctl"
+        cp "$CLI_PATH" "$BACKUP_PATH/xbnode"
     fi
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
@@ -819,8 +819,10 @@ install_staged_files() {
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 755 "$TMP_DIR/xbnode" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbnode 2>/dev/null || true
+    # 旧版命令行工具 xbctl 已改名为 xbnode，清理残留，避免新旧命令并存。
+    rm -f /usr/local/bin/xbctl /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
@@ -885,8 +887,10 @@ install_staged_binaries_only() {
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         install -m 755 "$0" "$INSTALLER_COPY_PATH"
     fi
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 755 "$TMP_DIR/xbnode" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbnode 2>/dev/null || true
+    # 旧版命令行工具 xbctl 已改名为 xbnode，清理残留，避免新旧命令并存。
+    rm -f /usr/local/bin/xbctl /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     if [ "$was_enabled" -eq 1 ] || [ "$had_service" -eq 0 ]; then
@@ -901,18 +905,18 @@ install_staged_binaries_only() {
     fi
 }
 
-# perform_install_only: install binaries + xbctl + service unit only, no
+# perform_install_only: install binaries + xbnode + service unit only, no
 # binding. Used when install runs without any panel/token/ID arguments
 # (V2bX-style "install first, bind later" flow). Existing config and
 # credentials are never touched, and the service is not started: with no
 # binding there is nothing valid for it to run, and starting it would
-# fail. Binding afterwards happens via the xbctl interactive menu
+# fail. Binding afterwards happens via the xbnode interactive menu
 # (option 1 node, option 2 machine), which restarts the service.
 perform_install_only() {
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
-    stage_xbctl
+    stage_xbnode
     render_service
     backup_existing_state
     install_staged_binaries_only
@@ -926,10 +930,10 @@ perform_install_only() {
     else
         log_info "服务单元已安装（开机自启状态保持不变：仍为 disabled，本次仅安装，不启动服务）"
     fi
-    log_info "请运行不带参数的 xbctl 打开中文交互菜单：xbctl"
+    log_info "请运行不带参数的 xbnode 打开中文交互菜单：xbnode"
     log_info "在菜单里选 1 绑定节点，或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID"
     log_info "绑定完成后服务会自动重启"
-    log_info "命令行工具：${CLI_PATH}（若 xbctl 不在 PATH 中，可运行 '${CLI_PATH} list'）"
+    log_info "命令行工具：${CLI_PATH}（若 xbnode 不在 PATH 中，可运行 '${CLI_PATH} list'）"
 }
 
 perform_install() {
@@ -942,7 +946,7 @@ perform_install() {
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
-    stage_xbctl
+    stage_xbnode
     render_config
     render_service
     backup_existing_state
@@ -956,7 +960,7 @@ perform_install() {
     if [ "$HEALTH_ENABLED" -eq 1 ]; then
         log_info "健康检查：http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
-    log_info "命令行工具：${CLI_PATH}（若 xbctl 不在 PATH 中，可运行 '${CLI_PATH} list'）"
+    log_info "命令行工具：${CLI_PATH}（若 xbnode 不在 PATH 中，可运行 '${CLI_PATH} list'）"
 }
 
 perform_upgrade() {
@@ -977,12 +981,14 @@ perform_upgrade() {
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
-    stage_xbctl
+    stage_xbnode
     render_service
     backup_existing_state
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 755 "$TMP_DIR/xbnode" "$CLI_PATH"
+    ln -sf "$CLI_PATH" /usr/bin/xbnode 2>/dev/null || true
+    # 旧版命令行工具 xbctl 已改名为 xbnode，清理残留，避免新旧命令并存。
+    rm -f /usr/local/bin/xbctl /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl restart "$SERVICE_NAME"
@@ -1054,7 +1060,7 @@ perform_uninstall() {
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
-    rm -f /usr/bin/xbctl 2>/dev/null || true
+    rm -f /usr/bin/xbnode 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
         log_info "已删除 ${INSTALL_ROOT}"

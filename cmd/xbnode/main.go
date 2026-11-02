@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	versionpkg "github.com/cedar2025/xboard-node/internal/version"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,7 +29,7 @@ const (
 	defaultMetaPath        = "/etc/xboard-node/install-meta.json"
 	defaultCredentialsPath = "/etc/xboard-node/credentials.env"
 	defaultBinaryPath      = "/usr/local/bin/xboard-node"
-	defaultCLIPath         = "/usr/local/bin/xbctl"
+	defaultCLIPath         = "/usr/local/bin/xbnode"
 	serviceName            = "xboard-node.service"
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
 	defaultInstallRoot     = "/etc/xboard-node"
@@ -36,8 +37,9 @@ const (
 )
 
 var (
-	version   = "dev"
-	buildTime = "unknown"
+	// version is the release version from internal/version; it is no
+	// longer overwritten with a commit hash at build time.
+	version = versionpkg.Version
 )
 
 type instanceRow struct {
@@ -191,7 +193,7 @@ func run(args []string) error {
 	case "uninstall":
 		return runUninstall(args[1:])
 	case "version", "-v", "--version":
-		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
+		fmt.Printf("xbnode %s\n", version)
 		return nil
 	case "config":
 		return runConfig(args[1:])
@@ -204,36 +206,36 @@ func run(args []string) error {
 }
 
 func printUsage() {
-	fmt.Println(`xbctl 命令：
-  xbctl（不带参数）             打开中文交互菜单（仅限终端）
-  xbctl menu                   打开中文交互菜单
-  xbctl kernel                 列出各实例的内核
-  xbctl kernel <id> <singbox|xray>  切换指定实例的内核
-  xbctl help                   显示本帮助
-  xbctl status                 查看运行状态
-  xbctl list [--output text|json]  列出全部实例
-  xbctl instance list [--output text|json]  列出实例
-  xbctl instance get <id> [--output text|json]  查看单个实例
-  xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]  初始化配置
-  xbctl config health-port [--config PATH]  查看健康检查端口
-  xbctl service status|start|stop|restart|enable|disable|logs  服务管理
-  xbctl health                 健康检查
-  xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]  绑定节点
-  xbctl bind add-machine --panel-url URL --token TOKEN --machine-id ID [--kernel singbox|xray]  绑定机器
-  xbctl bind remove <instance-id>  解绑实例
-  xbctl bind remove-node --panel URL --node-id ID  解绑节点
-  xbctl bind remove-machine --panel URL --machine-id ID  解绑机器
-  xbctl upgrade [--version VERSION]  升级
-  xbctl uninstall [--purge] [--yes]  卸载
-  xbctl version                查看版本
+	fmt.Println(`xbnode 命令：
+  xbnode（不带参数）             打开中文交互菜单（仅限终端）
+  xbnode menu                   打开中文交互菜单
+  xbnode kernel                 列出各实例的内核
+  xbnode kernel <id> <singbox|xray>  切换指定实例的内核
+  xbnode help                   显示本帮助
+  xbnode status                 查看运行状态
+  xbnode list [--output text|json]  列出全部实例
+  xbnode instance list [--output text|json]  列出实例
+  xbnode instance get <id> [--output text|json]  查看单个实例
+  xbnode config init --mode node|machine --panel-url URL --token TOKEN [flags]  初始化配置
+  xbnode config health-port [--config PATH]  查看健康检查端口
+  xbnode service status|start|stop|restart|enable|disable|logs  服务管理
+  xbnode health                 健康检查
+  xbnode bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]  绑定节点
+  xbnode bind add-machine --panel-url URL --token TOKEN --machine-id ID [--kernel singbox|xray]  绑定机器
+  xbnode bind remove <instance-id>  解绑实例
+  xbnode bind remove-node --panel URL --node-id ID  解绑节点
+  xbnode bind remove-machine --panel URL --machine-id ID  解绑机器
+  xbnode upgrade [--version VERSION]  升级
+  xbnode uninstall [--purge] [--yes]  卸载
+  xbnode version                查看版本
 
 快捷方式：
-  xbctl start|stop|restart        = xbctl service start|stop|restart
-  xbctl log|logs                  = xbctl service logs
-  xbctl bind-node ...             = xbctl bind add-node ...
-  xbctl bind-machine ...          = xbctl bind add-machine ...
-  xbctl unbind-node ...           = xbctl bind remove-node ...
-  xbctl unbind-machine ...        = xbctl bind remove-machine ...`)
+  xbnode start|stop|restart        = xbnode service start|stop|restart
+  xbnode log|logs                  = xbnode service logs
+  xbnode bind-node ...             = xbnode bind add-node ...
+  xbnode bind-machine ...          = xbnode bind add-machine ...
+  xbnode unbind-node ...           = xbnode bind remove-node ...
+  xbnode unbind-machine ...        = xbnode bind remove-machine ...`)
 }
 
 func runStatus() error {
@@ -285,7 +287,7 @@ func runInstance(args []string) error {
 		return fmt.Errorf("unknown instance command: %s", args[0])
 	}
 	if len(args) < 2 {
-		return errors.New("usage: xbctl instance get <id> [--output text|json]")
+		return errors.New("usage: xbnode instance get <id> [--output text|json]")
 	}
 	id := args[1]
 	output := parseOutput(args[2:])
@@ -303,7 +305,7 @@ func runInstance(args []string) error {
 
 func runService(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: xbctl service <status|start|stop|restart|enable|disable|logs>")
+		return errors.New("usage: xbnode service <status|start|stop|restart|enable|disable|logs>")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -333,7 +335,7 @@ func runHealth() error {
 
 func runBind(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: xbctl bind <add-node|add-machine|remove-node|remove-machine> ...")
+		return errors.New("usage: xbnode bind <add-node|add-machine|remove-node|remove-machine> ...")
 	}
 	if err := ensureRoot("bind"); err != nil {
 		return err
@@ -359,7 +361,7 @@ func runBind(args []string) error {
 		return removeBinding(panel, 0, machineID, "")
 	case "remove":
 		if len(rest) == 0 {
-			return errors.New("usage: xbctl bind remove <instance-id>")
+			return errors.New("usage: xbnode bind remove <instance-id>")
 		}
 		return removeBinding("", 0, 0, rest[0])
 	default:
@@ -497,7 +499,7 @@ func runUpgrade(args []string) error {
 	binaryDir := filepath.Dir(defaultBinaryPath)
 	cliDir := filepath.Dir(defaultCLIPath)
 	newBinary := filepath.Join(binaryDir, ".xboard-node.new")
-	newCLI := filepath.Join(cliDir, ".xbctl.new")
+	newCLI := filepath.Join(cliDir, ".xbnode.new")
 
 	// Download with the same latest → dev fallback as install.sh's
 	// download_artifact: only a 404 on the latest release falls back
@@ -524,16 +526,16 @@ func runUpgrade(args []string) error {
 		return fmt.Errorf("download binary: %w", err)
 	}
 
-	if err := downloadUpgradeArtifact(fmt.Sprintf("xbctl-linux-%s", arch), newCLI); err != nil {
+	if err := downloadUpgradeArtifact(fmt.Sprintf("xbnode-linux-%s", arch), newCLI); err != nil {
 		os.Remove(newBinary)
-		return fmt.Errorf("download xbctl: %w", err)
+		return fmt.Errorf("download xbnode: %w", err)
 	}
 
 	if err := os.Chmod(newBinary, 0o755); err != nil {
 		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod binary: %w", err))
 	}
 	if err := os.Chmod(newCLI, 0o755); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod xbctl: %w", err))
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod xbnode: %w", err))
 	}
 
 	// Validate downloaded binaries
@@ -541,7 +543,7 @@ func runUpgrade(args []string) error {
 		return cleanupFiles(newBinary, newCLI, fmt.Errorf("binary version check failed: %s", string(out)))
 	}
 	if out, err := exec.Command(newCLI, "version").CombinedOutput(); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("xbctl version check failed: %s", string(out)))
+		return cleanupFiles(newBinary, newCLI, fmt.Errorf("xbnode version check failed: %s", string(out)))
 	}
 
 	// Backup existing binaries
@@ -555,7 +557,7 @@ func runUpgrade(args []string) error {
 	}
 	if fileExists(defaultCLIPath) {
 		if err := copyFile(defaultCLIPath, backupCLI); err != nil {
-			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup xbctl: %w", err))
+			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup xbnode: %w", err))
 		}
 	}
 
@@ -568,12 +570,12 @@ func runUpgrade(args []string) error {
 			os.Rename(backupBinary, defaultBinaryPath)
 		}
 		os.Remove(newCLI)
-		return fmt.Errorf("replace xbctl: %w", err)
+		return fmt.Errorf("replace xbnode: %w", err)
 	}
 
-	// Recreate /usr/bin/xbctl symlink
-	os.Remove("/usr/bin/xbctl")
-	os.Symlink(defaultCLIPath, "/usr/bin/xbctl")
+	// Recreate /usr/bin/xbnode symlink
+	os.Remove("/usr/bin/xbnode")
+	os.Symlink(defaultCLIPath, "/usr/bin/xbnode")
 
 	// Restart service
 	fmt.Println("Restarting service...")
@@ -589,7 +591,7 @@ func runUpgrade(args []string) error {
 		}
 		if fileExists(backupCLI) {
 			if e := os.Rename(backupCLI, defaultCLIPath); e != nil {
-				fmt.Printf("Warning: rollback xbctl failed: %v\n", e)
+				fmt.Printf("Warning: rollback xbnode failed: %v\n", e)
 				rollbackOK = false
 			}
 		}
@@ -672,7 +674,7 @@ func runUninstall(args []string) error {
 
 	// Remove binaries
 	// Remove binaries and symlinks
-	for _, p := range []string{defaultBinaryPath, defaultCLIPath, "/usr/bin/xbctl"} {
+	for _, p := range []string{defaultBinaryPath, defaultCLIPath, "/usr/bin/xbnode"} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			warnings = append(warnings, fmt.Sprintf("remove %s: %v", p, err))
 		}
@@ -865,7 +867,7 @@ func parseRemoveNodeArgs(args []string) (string, int, error) {
 		}
 	}
 	if strings.TrimSpace(panel) == "" || nodeID <= 0 {
-		return "", 0, errors.New("usage: xbctl bind remove-node --panel URL --node-id ID")
+		return "", 0, errors.New("usage: xbnode bind remove-node --panel URL --node-id ID")
 	}
 	return strings.TrimSpace(panel), nodeID, nil
 }
@@ -896,7 +898,7 @@ func parseRemoveMachineArgs(args []string) (string, int, error) {
 		}
 	}
 	if strings.TrimSpace(panel) == "" || machineID <= 0 {
-		return "", 0, errors.New("usage: xbctl bind remove-machine --panel URL --machine-id ID")
+		return "", 0, errors.New("usage: xbnode bind remove-machine --panel URL --machine-id ID")
 	}
 	return strings.TrimSpace(panel), machineID, nil
 }
@@ -981,7 +983,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		runCommand("systemctl", "stop", serviceName)
 		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
-		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
+		fmt.Println("Use 'xbnode bind add-node/add-machine' to add a new binding, or 'xbnode uninstall' to fully uninstall.")
 		return nil
 	}
 
@@ -1467,7 +1469,7 @@ func machineIDPtr(cfg *config.Config) *int {
 
 func runConfig(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: xbctl config <init|health-port>")
+		return errors.New("usage: xbnode config <init|health-port>")
 	}
 	switch args[0] {
 	case "init":

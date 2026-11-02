@@ -47,8 +47,6 @@ jobs:
           cache: true
 
       - name: Build
-        env:
-          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
         run: |
           if [ "${{ matrix.goarch }}" = "amd64" ]; then
             make build-linux
@@ -62,11 +60,11 @@ jobs:
           name: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
           path: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
 
-      - name: Upload xbctl artifact
+      - name: Upload xbnode artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: xbnode-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: xbnode-${{ matrix.goos }}-${{ matrix.goarch }}
 
   release:
     name: Release
@@ -83,14 +81,14 @@ jobs:
           merge-multiple: true
           path: dist
       # Publish SHA-256 sidecars next to every binary so install.sh and
-      # xbctl upgrade can verify downloads instead of trusting the
+      # xbnode upgrade can verify downloads instead of trusting the
       # version self-check alone. The sidecar format is the standard
       # "<hash>  <filename>" output of sha256sum, which both verifiers
       # parse by taking the first field.
       - name: Generate SHA-256 checksums
         run: |
           cd dist
-          for f in xboard-node-linux-amd64 xboard-node-linux-arm64 xbctl-linux-amd64 xbctl-linux-arm64; do
+          for f in xboard-node-linux-amd64 xboard-node-linux-arm64 xbnode-linux-amd64 xbnode-linux-arm64; do
             sha256sum "$f" > "$f.sha256"
           done
       - name: Release
@@ -103,7 +101,7 @@ jobs:
             dist/xboard-node-linux-amd64.sha256
             dist/xboard-node-linux-arm64
             dist/xboard-node-linux-arm64.sha256
-            dist/xbctl-linux-amd64
-            dist/xbctl-linux-amd64.sha256
-            dist/xbctl-linux-arm64
-            dist/xbctl-linux-arm64.sha256
+            dist/xbnode-linux-amd64
+            dist/xbnode-linux-amd64.sha256
+            dist/xbnode-linux-arm64
+            dist/xbnode-linux-arm64.sha256
