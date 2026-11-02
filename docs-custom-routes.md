@@ -1,6 +1,6 @@
-# Custom Routes
+# 自定义路由
 
-## Quick Example
+## 快速示例
 
 ```json
 {
@@ -24,41 +24,41 @@
 }
 ```
 
-## Match Conditions
+## 匹配条件
 
-| Condition | Description | Example |
+| 条件 | 说明 | 示例 |
 |-----------|-------------|---------|
-| `domains` | Exact domain match | `["api.example.com"]` |
-| `domain_suffixes` | Suffix match | `["example.com"]` |
-| `ip_cidrs` | IP CIDR ranges | `["10.0.0.0/8"]` |
-| `ports` | Port (single or range) | `["443", "8000-9000"]` |
-| `networks` | Protocol | `["tcp"]` or `["udp"]` |
-| `source_cidrs` | Source IP CIDR | `["192.168.1.0/24"]` |
-| `source_ports` | Source port | `["1024-65535"]` |
+| `domains` | 精确匹配域名 | `["api.example.com"]` |
+| `domain_suffixes` | 后缀匹配 | `["example.com"]` |
+| `ip_cidrs` | IP CIDR 段 | `["10.0.0.0/8"]` |
+| `ports` | 端口（单个或范围） | `["443", "8000-9000"]` |
+| `networks` | 协议 | `["tcp"]` 或 `["udp"]` |
+| `source_cidrs` | 来源 IP CIDR | `["192.168.1.0/24"]` |
+| `source_ports` | 来源端口 | `["1024-65535"]` |
 
-## Action Types
+## 动作类型
 
-| Action | Description |
+| 动作 | 说明 |
 |--------|-------------|
-| `{"type": "direct"}` | Direct connection, bypass proxy |
-| `{"type": "block"}` | Block connection |
-| `{"type": "route", "target": "tag"}` | Route to specified outbound (by tag) |
+| `{"type": "direct"}` | 直连，不走代理 |
+| `{"type": "block"}` | 拦截连接 |
+| `{"type": "route", "target": "tag"}` | 路由到指定出站（填出站的 tag） |
 
-## Application Order
+## 生效顺序
 
-1. Structured `custom_route_rules` (highest priority)
-2. Raw `custom_routes`
-3. Built-in blocklist rules
-4. Panel routes
+1. 结构化 `custom_route_rules`（优先级最高）
+2. 原生 `custom_routes`
+3. 内置拦截规则
+4. 面板路由
 
-## Kernel Compatibility
+## 内核兼容性
 
-| Feature | Xray | Sing-box |
+| 功能 | Xray | Sing-box |
 |---------|------|----------|
-| All match conditions | ✅ | ✅ |
+| 全部匹配条件 | ✅ | ✅ |
 | direct / block / route | ✅ | ✅ |
 
-## Best Practices
+## 最佳实践
 
-- **Prefer** `custom_route_rules`: cross-kernel compatible, panel-managed
-- **Use** `custom_routes` only: when native features are needed (e.g., load balancing)
+- **优先用** `custom_route_rules`：双内核通用，由面板管理
+- `custom_routes` **只在**需要原生功能时用（例如负载均衡）

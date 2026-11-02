@@ -1,13 +1,13 @@
-# Xboard Node Configuration
-# Top-level settings are inherited by all instances. Instance overrides take precedence.
+# Xboard 节点配置
+# 顶层配置会被全部实例继承，实例里的配置优先。
 
-# ── Single node (simplest) ──
+# ── 单节点（最简单）──
 # panel:
 #   url: "https://panel.example.com"
 #   token: "your-api-key"
 #   node_id: 1
 
-# ── Multiple instances ──
+# ── 多实例 ──
 # kernel:
 #   type: "singbox"
 # log:
@@ -23,4 +23,4 @@
 #       machine_id: 2
 #       token: "machine-token-2"
 #     log:
-#       level: "debug"   # override for this instance only
+#       level: "debug"   # 只对这个实例生效

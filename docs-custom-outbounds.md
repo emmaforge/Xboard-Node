@@ -1,6 +1,6 @@
-# Custom Outbounds
+# 自定义出站
 
-## Quick Example
+## 快速示例
 
 ```json
 {
@@ -23,9 +23,9 @@
 }
 ```
 
-## Supported Protocols
+## 支持的协议
 
-| Protocol | Xray | Sing-box |
+| 协议 | Xray | Sing-box |
 |----------|------|----------|
 | vmess | ✅ | ✅ |
 | vless | ✅ | ✅ |
@@ -40,16 +40,16 @@
 | naive | ❌ | ✅ |
 | mieru | ❌ | ✅ |
 
-## Core Fields
+## 核心字段
 
-| Field | Required | Description |
+| 字段 | 是否必填 | 说明 |
 |-------|----------|-------------|
-| `tag` | ✅ | Outbound tag, referenced in routes |
-| `protocol` | ✅ | Protocol type |
-| `settings` | ✅ | Protocol-specific configuration |
-| `proxy_tag` | ❌ | Chain to another outbound (references its tag) |
+| `tag` | ✅ | 出站标识，在路由中引用它 |
+| `protocol` | ✅ | 协议类型 |
+| `settings` | ✅ | 该协议的专属配置 |
+| `proxy_tag` | ❌ | 串联到另一个出站（填对方的 tag） |
 
-## Best Practices
+## 最佳实践
 
-- **Prefer** `custom_outbounds`: panel-managed, cross-kernel compatible
-- **Use** `kernel.custom_outbound` only: when native fields are needed
+- **优先用** `custom_outbounds`：由面板管理，双内核通用
+- `kernel.custom_outbound` **只在**需要原生字段时用

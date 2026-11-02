@@ -27,7 +27,7 @@ DEFAULT_ACTION="install"
 DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
-DEFAULT_DOWNLOAD_BASE="https://github.com/cedar2025/xboard-node/releases"
+DEFAULT_DOWNLOAD_BASE="https://github.com/zzx327317-creator/Xboard-Node/releases"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -93,7 +93,7 @@ load_health_port_from_config() {
 }
 
 rollback_install() {
-    log_warn "Rolling back installation"
+    log_warn "正在回滚安装"
     if [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ]; then
         if [ -f "$BACKUP_PATH/xboard-node" ]; then
             install -m 755 "$BACKUP_PATH/xboard-node" "$BINARY_PATH"
@@ -132,21 +132,21 @@ rollback_install() {
         systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
         if ! wait_for_health; then
-            log_error "Rollback completed but restored service did not become healthy"
+            log_error "回滚已完成，但恢复后的服务未通过健康检查"
             show_recent_logs
             return 1
         fi
     else
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
-    log_warn "Rollback complete"
+    log_warn "回滚完成"
 }
 
 on_error() {
     local exit_code=$?
     local line_no=${1:-unknown}
     if [ "$exit_code" -ne 0 ]; then
-        log_error "Install failed at line ${line_no} (exit=${exit_code})"
+        log_error "安装失败，位置：第 ${line_no} 行（退出码 ${exit_code}）"
         if [ -n "$BACKUP_PATH" ]; then
             rollback_install || true
         fi
@@ -160,43 +160,43 @@ trap cleanup_tmp EXIT
 usage() {
     cat <<'HELP'
 
-  xboard-node Installer
+  xboard-node 安装脚本
 
-  ACTIONS:
-    install      Install or reconcile the configured deployment (default)
-    upgrade      Upgrade binary and restart service
-    uninstall    Remove installed service and binary (config kept unless --purge)
-    status       Show current installation status
-    help         Show this help
+  操作：
+    install      安装或校准已有部署（默认）
+    upgrade      升级二进制文件并重启服务
+    uninstall    删除已安装的服务和二进制文件（除非加 --purge，否则保留配置）
+    status       显示当前安装状态
+    help         显示本帮助
 
-  MODES (auto-detected from --node-id or --machine-id if omitted):
-    --mode node      Panel single-node mode (default)
-    --mode machine   Panel machine mode
+  模式（不指定时按 --node-id 或 --machine-id 自动判断）：
+    --mode node      面板单节点模式（默认）
+    --mode machine   面板机器模式
 
-  REQUIRED FOR NODE MODE:
-    --panel, -a      Panel URL
-    --token, -t      Panel server token
-    --node-id, -n    Node ID
+  节点模式必填：
+    --panel, -a      面板地址
+    --token, -t      面板服务端密钥
+    --node-id, -n    节点 ID
 
-  REQUIRED FOR MACHINE MODE:
-    --panel, -a       Panel URL
-    --token, -t       Machine token
-    --machine-id      Machine ID
+  机器模式必填：
+    --panel, -a       面板地址
+    --token, -t       机器密钥
+    --machine-id      机器 ID
 
-  OPTIONAL:
-    --node-type, -T     Explicit node type for node mode
-    --kernel, -k        singbox or xray (default: singbox)
-    --version           Release version or latest (default: latest)
-    --binary            Use a local xboard-node binary path instead of downloading
-    --xbctl-binary      Use a local xbctl binary path instead of downloading
-    --health-port       Local health port (default: 65530, use 0 to disable)
-    --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
-    --gogc              Runtime GOGC value, e.g. 50
-    --force-reconfigure Overwrite an existing install even if mode/target changed
-    --purge             With uninstall, delete /etc/xboard-node too
-    --yes, -y           Non-interactive confirmation for destructive operations
+  可选：
+    --node-type, -T     节点模式下显式指定节点类型
+    --kernel, -k        singbox 或 xray（默认：singbox）
+    --version           发布版本或 latest（默认：latest）
+    --binary            使用本地 xboard-node 二进制文件路径，不从网上下载
+    --xbctl-binary      使用本地 xbctl 二进制文件路径，不从网上下载
+    --health-port       本地健康检查端口（默认：65530，0 表示禁用）
+    --gomemlimit        运行时 GOMEMLIMIT，例如 256MiB
+    --gogc              运行时 GOGC，例如 50
+    --force-reconfigure 即使模式或目标变了，也覆盖已有安装
+    --purge             配合 uninstall，同时删除 /etc/xboard-node
+    --yes, -y           对破坏性操作做非交互确认
 
-  EXAMPLES:
+  示例：
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --node-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh upgrade
@@ -310,7 +310,7 @@ parse_args() {
     case "$MODE" in
         node|machine) ;;
         *)
-            log_error "Unsupported mode: $MODE"
+            log_error "不支持的模式：$MODE"
             usage
             exit 1
             ;;
@@ -319,7 +319,7 @@ parse_args() {
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        log_error "Please run as root or with sudo"
+        log_error "请以 root 身份或使用 sudo 运行"
         exit 1
     fi
 }
@@ -331,7 +331,7 @@ detect_arch() {
         x86_64|amd64) ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
         *)
-            log_error "Unsupported architecture: $raw"
+            log_error "不支持的架构：$raw"
             exit 1
             ;;
     esac
@@ -348,11 +348,11 @@ detect_os() {
 
 ensure_systemd() {
     if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "systemd is required for this installer"
+        log_error "本安装脚本需要 systemd"
         exit 1
     fi
     if [ ! -d /run/systemd/system ]; then
-        log_error "This host does not appear to be running systemd"
+        log_error "本机似乎未运行 systemd"
         exit 1
     fi
 }
@@ -367,7 +367,7 @@ run_with_retry() {
             return 0
         fi
         if [ "$i" -lt "$attempts" ]; then
-            log_warn "Command failed, retrying in ${delay}s: $*"
+            log_warn "命令失败，${delay} 秒后重试：$*"
             sleep "$delay"
         fi
         i=$((i + 1))
@@ -389,7 +389,7 @@ install_dependencies() {
             fi
             ;;
         *)
-            log_warn "OS ${OS} is not in the official support set; continuing best-effort"
+            log_warn "系统 ${OS} 不在官方支持列表中，将尽力继续安装"
             ;;
     esac
 }
@@ -403,22 +403,22 @@ validate_positive_int() {
     local label="$1"
     local value="$2"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -le 0 ]; then
-        log_error "${label} must be a positive integer, got: ${value}"
+        log_error "${label} 必须是正整数，实际值：${value}"
         exit 1
     fi
 }
 
 validate_install_request() {
     if [ -z "$PANEL_URL" ]; then
-        log_error "Panel URL is required"
+        log_error "必须提供面板地址"
         exit 1
     fi
     if [ -z "$TOKEN" ]; then
-        log_error "Token is required"
+        log_error "必须提供密钥"
         exit 1
     fi
     if ! [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
-        log_error "health-port must be a non-negative integer"
+        log_error "health-port 必须是非负整数"
         exit 1
     fi
     if [ "$HEALTH_PORT" -eq 0 ]; then
@@ -427,7 +427,7 @@ validate_install_request() {
     case "$KERNEL_TYPE" in
         singbox|xray) ;;
         *)
-            log_error "Kernel must be singbox or xray"
+            log_error "内核必须是 singbox 或 xray"
             exit 1
             ;;
     esac
@@ -461,23 +461,48 @@ require_reconfigure_confirmation() {
 }
 
 select_binary_source() {
+    # Only an explicitly requested local binary (--binary) is ever used.
+    # Previously, a same-named file in the current working directory
+    # (./xboard-node, ./xboard-node-linux-<arch>) was silently preferred
+    # over the release download, so a planted file in the installer's
+    # working directory would be installed without any check.
     if [ -n "$BINARY_SOURCE" ]; then
         if [ ! -f "$BINARY_SOURCE" ]; then
-            log_error "Binary source not found: $BINARY_SOURCE"
+            log_error "未找到二进制文件来源：$BINARY_SOURCE"
             exit 1
         fi
         echo "$BINARY_SOURCE"
         return
     fi
-    if [ -f "./xboard-node" ]; then
-        echo "./xboard-node"
-        return
-    fi
-    if [ -f "./xboard-node-linux-${ARCH}" ]; then
-        echo "./xboard-node-linux-${ARCH}"
-        return
-    fi
     echo ""
+}
+
+# verify_download <url> <file>: verify a downloaded file against the
+# release's published "<artifact>.sha256" sidecar, if one exists. A
+# mismatch is fatal. If no sidecar is published (older releases), warn
+# clearly and continue: failing hard would break installing those
+# releases, but new releases (see .github/workflows/ci.yml, which now
+# publishes .sha256 files) are always verified.
+verify_download() {
+    local url="$1" file="$2"
+    local sum_file="$TMP_DIR/checksum.txt"
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log_warn "本机没有 sha256sum，跳过 ${url} 的校验和验证"
+        return 0
+    fi
+    if ! curl -fsSL "${url}.sha256" -o "$sum_file" 2>/dev/null; then
+        log_warn "${url} 未发布 SHA-256 校验和，跳过校验和验证"
+        return 0
+    fi
+    local expected actual
+    expected=$(awk '{print $1}' "$sum_file")
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        log_error "${url} 的 SHA-256 校验和不匹配：期望 ${expected}，实际 ${actual}"
+        rm -f "$file"
+        exit 1
+    fi
+    log_step "SHA-256 校验通过：${file}"
 }
 
 resolve_download_url() {
@@ -489,56 +514,81 @@ resolve_download_url() {
     fi
 }
 
+# download_artifact <url> <out> <artifact>: download a release artifact.
+# When the requested version is "latest" but the fork has no version tag
+# yet, GitHub's /latest endpoint 404s (CI only marks tag releases as
+# latest; dev pushes publish under the "dev" tag with make_latest=false).
+# In that case fall back to the dev release with an explicit warning,
+# instead of failing an otherwise working fork install. A version tag
+# still has to be pushed for "latest" to point at a stable release.
+download_artifact() {
+    local url="$1" out="$2" artifact="$3"
+    if curl -fsSL "$url" -o "$out"; then
+        return 0
+    fi
+    if [ "$RELEASE_VERSION" = "latest" ]; then
+        local dev_url="${DEFAULT_DOWNLOAD_BASE}/download/dev/${artifact}"
+        log_warn "未找到最新正式版，回退到 dev 版：${dev_url}"
+        if curl -fsSL "$dev_url" -o "$out"; then
+            DOWNLOAD_URL="$dev_url"
+            return 0
+        fi
+    fi
+    DOWNLOAD_URL="$url"
+    return 1
+}
+
 stage_binary() {
     local staged="$TMP_DIR/xboard-node"
     local local_src
     local_src=$(select_binary_source)
     if [ -n "$local_src" ]; then
-        log_step "Using local binary: ${local_src}"
+        log_step "使用本地二进制文件：${local_src}"
         cp "$local_src" "$staged"
     else
         resolve_download_url "xboard-node-linux-${ARCH}"
-        log_step "Downloading binary: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download binary from ${DOWNLOAD_URL}"
+        log_step "正在下载二进制文件：${DOWNLOAD_URL}"
+        if ! download_artifact "$DOWNLOAD_URL" "$staged" "xboard-node-linux-${ARCH}"; then
+            log_error "从 ${DOWNLOAD_URL} 下载二进制文件失败"
             exit 1
         fi
+        verify_download "$DOWNLOAD_URL" "$staged"
     fi
     chmod +x "$staged"
     if ! "$staged" -v >/dev/null 2>&1; then
-        log_error "Downloaded binary failed version check"
+        log_error "下载的二进制文件未通过版本检查"
         exit 1
     fi
 }
 
 stage_xbctl() {
     local staged="$TMP_DIR/xbctl"
+    # Only an explicitly requested local binary (--xbctl-binary) is ever
+    # used; see select_binary_source for why implicit ./xbctl fallbacks
+    # were removed.
     local local_src=""
     if [ -n "$CLI_BINARY_SOURCE" ]; then
         if [ ! -f "$CLI_BINARY_SOURCE" ]; then
-            log_error "xbctl binary source not found: $CLI_BINARY_SOURCE"
+            log_error "未找到 xbctl 二进制文件来源：$CLI_BINARY_SOURCE"
             exit 1
         fi
         local_src="$CLI_BINARY_SOURCE"
-    elif [ -f "./xbctl" ]; then
-        local_src="./xbctl"
-    elif [ -f "./xbctl-linux-${ARCH}" ]; then
-        local_src="./xbctl-linux-${ARCH}"
     fi
     if [ -n "$local_src" ]; then
-        log_step "Using local xbctl binary: ${local_src}"
+        log_step "使用本地 xbctl 二进制文件：${local_src}"
         cp "$local_src" "$staged"
     else
         resolve_download_url "xbctl-linux-${ARCH}"
-        log_step "Downloading xbctl: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
+        log_step "正在下载 xbctl：${DOWNLOAD_URL}"
+        if ! download_artifact "$DOWNLOAD_URL" "$staged" "xbctl-linux-${ARCH}"; then
+            log_error "从 ${DOWNLOAD_URL} 下载 xbctl 失败"
             exit 1
         fi
+        verify_download "$DOWNLOAD_URL" "$staged"
     fi
     chmod +x "$staged"
     if ! "$staged" version > /dev/null 2>&1; then
-        log_error "Downloaded xbctl failed version check"
+        log_error "下载的 xbctl 未通过版本检查"
         exit 1
     fi
 }
@@ -580,7 +630,7 @@ render_config() {
 
     local output
     output=$("$TMP_DIR/xbctl" "${init_args[@]}") || {
-        log_error "xbctl config init failed"
+        log_error "xbctl config init 执行失败"
         exit 1
     }
 
@@ -592,7 +642,7 @@ render_service() {
     cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
-Documentation=https://github.com/cedar2025/xboard-node
+Documentation=https://github.com/zzx327317-creator/Xboard-Node
 After=network-online.target
 Wants=network-online.target
 
@@ -696,7 +746,7 @@ start_service() {
         systemctl start "$SERVICE_NAME"
     fi
     if ! wait_for_health; then
-        log_error "Service failed health check"
+        log_error "服务未通过健康检查"
         show_recent_logs
         return 1
     fi
@@ -716,20 +766,20 @@ perform_install() {
     install_staged_files
     start_service
 
-    log_info "Installation succeeded"
-    log_info "Service: ${SERVICE_NAME}"
-    log_info "Config: ${CONFIG_FILE}"
-    log_info "Credentials: ${CREDENTIALS_FILE}"
+    log_info "安装成功"
+    log_info "服务：${SERVICE_NAME}"
+    log_info "配置：${CONFIG_FILE}"
+    log_info "凭据：${CREDENTIALS_FILE}"
     if [ "$HEALTH_ENABLED" -eq 1 ]; then
-        log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
+        log_info "健康检查：http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
-    log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
+    log_info "命令行工具：${CLI_PATH}（若 xbctl 不在 PATH 中，可运行 '${CLI_PATH} list'）"
 }
 
 perform_upgrade() {
     detect_current_state
     if [ "$CURRENT_STATE" = "fresh" ]; then
-        log_warn "No existing install found; falling back to install"
+        log_warn "未找到已有安装，回退到全新安装"
         perform_install
         return
     fi
@@ -746,11 +796,23 @@ perform_upgrade() {
     systemctl daemon-reload
     systemctl restart "$SERVICE_NAME"
     if ! wait_for_health; then
-        log_error "Upgrade health check failed"
+        log_error "升级后健康检查失败"
         show_recent_logs
+        # B13: roll back explicitly instead of relying on the ERR trap.
+        # Verified: with `set -Eeuo pipefail` and a bare call, the trap
+        # does fire on this return — but only in that exact call shape.
+        # If perform_upgrade were ever called in a condition (if/||/!)
+        # or with `|| true`, bash suppresses the ERR trap and the new
+        # binary would stay installed while unhealthy. Clearing
+        # BACKUP_PATH afterwards also stops the trap from running the
+        # same rollback a second time on the way out.
+        if ! rollback_install; then
+            log_error "升级失败后的回滚也失败了，需要手动处理"
+        fi
+        BACKUP_PATH=""
         return 1
     fi
-    log_info "Upgrade succeeded"
+    log_info "升级成功"
 }
 
 confirm_uninstall() {
@@ -760,7 +822,7 @@ confirm_uninstall() {
     echo
     read -r -p "Proceed with uninstall? [y/N]: " answer
     if ! [[ "$answer" =~ ^[Yy]$ ]]; then
-        log_warn "Uninstall cancelled"
+        log_warn "已取消卸载"
         exit 0
     fi
 }
@@ -778,21 +840,21 @@ perform_uninstall() {
     rm -f /usr/bin/xbctl 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
-        log_info "Removed ${INSTALL_ROOT}"
+        log_info "已删除 ${INSTALL_ROOT}"
     else
         rm -f "$INSTALL_META"
-        log_info "Config preserved under ${INSTALL_ROOT}"
+        log_info "配置保留在 ${INSTALL_ROOT} 下"
     fi
-    log_info "Uninstall complete"
+    log_info "卸载完成"
 }
 
 perform_status() {
     detect_current_state
     echo
-    echo -e "${BOLD}xboard-node install status${NC}"
-    echo "  state:   ${CURRENT_STATE}"
+    echo -e "${BOLD}xboard-node 安装状态${NC}"
+    echo "  状态：  ${CURRENT_STATE}"
     if [ -f "$INSTALL_META" ]; then
-        echo "  meta:    ${INSTALL_META}"
+        echo "  元数据：${INSTALL_META}"
         if [ -x "$CLI_PATH" ]; then
             "$CLI_PATH" list 2>/dev/null || true
         else
@@ -806,7 +868,7 @@ perform_status() {
         fi
     fi
     if [ -f "$SERVICE_PATH" ]; then
-        echo "  service: ${SERVICE_NAME}"
+        echo "  服务：  ${SERVICE_NAME}"
         systemctl status "$SERVICE_NAME" --no-pager || true
     fi
 }
@@ -842,7 +904,7 @@ main() {
             perform_uninstall
             ;;
         *)
-            log_error "Unknown action: $ACTION"
+            log_error "未知操作：$ACTION"
             usage
             exit 1
             ;;
