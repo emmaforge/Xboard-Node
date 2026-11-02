@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
@@ -19,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -84,6 +86,15 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// globalDevices is the panel-aggregated cross-node device state
+	// (email -> IPs), refreshed via UpdateGlobalDevices from WS
+	// sync.devices events. It mirrors the sing-box tracker's global state;
+	// without it, xray nodes enforced device limits using only local
+	// connections and cross-node limits silently did not apply.
+	globalMu         sync.RWMutex
+	globalDevices    map[string]map[string]bool
+	globalLastUpdate time.Time
 
 	// links indexes live connections by session email so a removed user can
 	// be force-disconnected (CloseUserConnections). It is guarded by its own
@@ -172,7 +183,7 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 		return "", "", nil
 	}
 	email = si.User.Email
-	sourceIP = si.Source.Address.IP().String()
+	sourceIP = kernel.NormalizeDeviceIP(si.Source.Address.IP().String())
 
 	if d.checkDeviceLimit(email, sourceIP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
@@ -425,15 +436,39 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 		return false
 	}
 
-	if ips != nil && len(ips) < limit {
-		d.mu.RUnlock()
-		d.mu.Lock()
-		if d.limitedIPs[email] == nil {
-			d.limitedIPs[email] = make(map[string]int)
+	// Fast-allow only when the merged local + cross-node device count is
+	// still under the limit. Using the local count alone here would let
+	// a new device through whenever this node alone was under the limit,
+	// defeating cross-node enforcement. Over-limit cases fall through to
+	// the deterministic write-lock check below (which also admits IPs
+	// already known globally).
+	if ips != nil {
+		globalIPs := d.globalIPsFor(email)
+		if globalIPs != nil && globalIPs[sourceIP] {
+			d.mu.RUnlock()
+			d.mu.Lock()
+			d.limitedIPs[email][sourceIP]++
+			d.mu.Unlock()
+			return false
 		}
-		d.limitedIPs[email][sourceIP]++
-		d.mu.Unlock()
-		return false
+		merged := len(ips)
+		if globalIPs != nil {
+			for ip := range globalIPs {
+				if ips[ip] == 0 {
+					merged++
+				}
+			}
+		}
+		if merged < limit {
+			d.mu.RUnlock()
+			d.mu.Lock()
+			if d.limitedIPs[email] == nil {
+				d.limitedIPs[email] = make(map[string]int)
+			}
+			d.limitedIPs[email][sourceIP]++
+			d.mu.Unlock()
+			return false
+		}
 	}
 	d.mu.RUnlock()
 
@@ -453,14 +488,32 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 		return false
 	}
 
-	if len(ips) < limit {
+	// Merge cross-node state when fresh: a source IP already seen on
+	// another node counts toward the limit, and an IP known globally
+	// is admitted (counted locally) instead of being double-counted
+	// as a new device. Stale or missing global state -> local-only.
+	effective := make(map[string]bool, len(ips)+1)
+	for ip := range ips {
+		effective[ip] = true
+	}
+	if globalIPs := d.globalIPsFor(email); globalIPs != nil {
+		if globalIPs[sourceIP] {
+			ips[sourceIP]++
+			return false
+		}
+		for ip := range globalIPs {
+			effective[ip] = true
+		}
+	}
+
+	if len(effective) < limit {
 		ips[sourceIP]++
 		return false
 	}
 
 	// Over limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(ips)+1)
-	for ip := range ips {
+	ipList := make([]string, 0, len(effective)+1)
+	for ip := range effective {
 		ipList = append(ipList, ip)
 	}
 	ipList = append(ipList, sourceIP)
@@ -473,6 +526,43 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 		}
 	}
 	return true
+}
+
+// UpdateGlobalDevices syncs panel-aggregated cross-node device state.
+// IPs are canonicalized on ingest (IPv6 -> /64) so state reported by
+// nodes on an older build still merges with local canonical keys.
+func (d *LimitDispatcher) UpdateGlobalDevices(users map[string]map[string]bool) {
+	d.globalMu.Lock()
+	defer d.globalMu.Unlock()
+	d.globalDevices = make(map[string]map[string]bool, len(users))
+	for email, ips := range users {
+		m := make(map[string]bool, len(ips))
+		for ip := range ips {
+			m[kernel.NormalizeDeviceIP(ip)] = true
+		}
+		d.globalDevices[email] = m
+	}
+	d.globalLastUpdate = time.Now()
+}
+
+// ClearGlobalDevices resets cross-node device state (on WS disconnect).
+func (d *LimitDispatcher) ClearGlobalDevices() {
+	d.globalMu.Lock()
+	defer d.globalMu.Unlock()
+	d.globalDevices = make(map[string]map[string]bool)
+	d.globalLastUpdate = time.Time{}
+}
+
+// globalIPsFor snapshots the cross-node IP set for one user, or nil when
+// the state is stale (>60s, same threshold as the sing-box tracker) or
+// missing, in which case callers fall back to local-only counting.
+func (d *LimitDispatcher) globalIPsFor(email string) map[string]bool {
+	d.globalMu.RLock()
+	defer d.globalMu.RUnlock()
+	if time.Since(d.globalLastUpdate) > 60*time.Second {
+		return nil
+	}
+	return d.globalDevices[email]
 }
 
 // delConn decrements the IP refcount when a connection closes.

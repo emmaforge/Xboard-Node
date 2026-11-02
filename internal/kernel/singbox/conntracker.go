@@ -15,6 +15,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -194,7 +195,10 @@ func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
 	for uid, ips := range users {
 		m := make(map[string]bool, len(ips))
 		for _, ip := range ips {
-			m[ip] = true
+			// Canonicalize on ingest so global state from nodes on an
+			// older build (full IPv6 addresses) still merges with the
+			// local /64-canonical keys instead of double-counting.
+			m[kernel.NormalizeDeviceIP(ip)] = true
 		}
 		t.globalDevices[uid] = m
 	}
@@ -222,7 +226,7 @@ func (t *ConnTracker) RoutedConnection(
 	_ adapter.Rule, _ adapter.Outbound,
 ) net.Conn {
 	uuid := metadata.User
-	sourceIP := metadata.Source.Addr.String()
+	sourceIP := kernel.NormalizeDeviceIP(metadata.Source.Addr.String())
 
 	t.usersMu.RLock()
 	uid := t.uuidMap[uuid]
@@ -283,7 +287,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 	_ adapter.Rule, _ adapter.Outbound,
 ) N.PacketConn {
 	uuid := metadata.User
-	sourceIP := metadata.Source.Addr.String()
+	sourceIP := kernel.NormalizeDeviceIP(metadata.Source.Addr.String())
 
 	t.usersMu.RLock()
 	uid := t.uuidMap[uuid]

@@ -2,6 +2,7 @@ package xray
 
 import (
 	"sync/atomic"
+	"time"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -285,5 +286,49 @@ func TestLimitDispatcher_DeviceLimitCountsUDPSessions(t *testing.T) {
 	ld.delConn(email, "1.1.1.1")
 	if ld.checkDeviceLimit(email, "2.2.2.2") {
 		t.Fatal("device slot should be released after delConn")
+	}
+}
+
+func TestLimitDispatcher_GlobalDevicesEnforced(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	// One local device, one device on another node: the merged count
+	// already hits the limit of 2, so a third device must be rejected
+	// even though this node alone only sees one IP.
+	if ld.checkDeviceLimit(email, "1.1.1.1") {
+		t.Fatal("first local IP should be allowed")
+	}
+	ld.UpdateGlobalDevices(map[string]map[string]bool{email: {"2.2.2.2": true}})
+	if !ld.checkDeviceLimit(email, "3.3.3.3") {
+		t.Fatal("third device should be rejected once cross-node state fills the limit")
+	}
+	// An IP already known globally is admitted, not double-counted.
+	if ld.checkDeviceLimit(email, "2.2.2.2") {
+		t.Fatal("globally known IP should be admitted")
+	}
+	// Stale global state falls back to local-only counting: on a fresh
+	// dispatcher with one local IP, a stale global entry must not push
+	// the merged count to the limit.
+	ld2 := newTestDispatcher()
+	ld2.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+	if ld2.checkDeviceLimit(email, "1.1.1.1") {
+		t.Fatal("first local IP should be allowed")
+	}
+	ld2.UpdateGlobalDevices(map[string]map[string]bool{email: {"2.2.2.2": true}})
+	ld2.globalLastUpdate = time.Now().Add(-2 * time.Minute)
+	if ld2.checkDeviceLimit(email, "3.3.3.3") {
+		t.Fatal("with stale global state, local-only counting should admit a new IP under the local limit")
+	}
+}
+
+func TestLimitDispatcher_GlobalDevicesIPv6Canonical(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	ld.UpdateGlobalDevices(map[string]map[string]bool{email: {"2001:db8:abcd:1234:5678::1": true}})
+	got := ld.globalIPsFor(email)
+	if got == nil || !got["2001:db8:abcd:1234::"] {
+		t.Fatalf("global IPs should be canonicalized to /64, got %v", got)
 	}
 }
