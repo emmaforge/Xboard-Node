@@ -82,3 +82,43 @@ func TestValidateCustomRouteRules(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateCustomRouteRules_Formats(t *testing.T) {
+	// Regression test for B11: IP/CIDR and domain matchers used to
+	// skip format validation entirely, so typos silently matched
+	// nothing at runtime.
+	valid := func(match RouteMatch) []CustomRouteRule {
+		return []CustomRouteRule{{Match: match, Action: RouteAction{Type: "block"}}}
+	}
+	validCases := []struct {
+		kernel string
+		match  RouteMatch
+	}{
+		{"singbox", RouteMatch{IPCIDRs: []string{"10.0.0.0/8", "2001:db8::/32", "192.168.1.1"}}},
+		{"singbox", RouteMatch{SourceCIDRs: []string{"0.0.0.0/0"}}},
+		{"singbox", RouteMatch{Domains: []string{"example.com", "sub.example.co.uk"}}},
+		{"xray", RouteMatch{Domains: []string{"domain:example.com", "regexp:^.*\\.example\\.com$"}}},
+		{"singbox", RouteMatch{DomainSuffixes: []string{"example.com"}}},
+	}
+	for i, vc := range validCases {
+		if err := ValidateCustomRouteRules(valid(vc.match), vc.kernel, nil); err != nil {
+			t.Errorf("valid case %d should pass, got %v", i, err)
+		}
+	}
+	invalidCases := []RouteMatch{
+		{IPCIDRs: []string{"10.0.0.256/8"}},
+		{IPCIDRs: []string{"not-an-ip"}},
+		{SourceCIDRs: []string{"192.168.1.0/33"}},
+		{Domains: []string{"exa mple.com"}},
+		{Domains: []string{"*.example.com"}},
+		{Domains: []string{"example..com"}},
+		{Domains: []string{"regexp:([invalid"}},
+		{Domains: []string{"domain:example.com"}},
+		{DomainSuffixes: []string{"-bad.example.com"}},
+	}
+	for i, m := range invalidCases {
+		if err := ValidateCustomRouteRules(valid(m), "singbox", nil); err == nil {
+			t.Errorf("invalid case %d should fail: %+v", i, m)
+		}
+	}
+}

@@ -96,6 +96,14 @@ type WSClientConfig struct {
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
 // Authentication is done via query parameters (token + node_id) during the
 // WebSocket handshake — no separate auth step needed.
+//
+// B7: the token must stay in the query. The Xboard panel's Server /
+// ServerV2 middleware validates $request->input('token'), which Laravel
+// fills from the query string, form fields and JSON body — never from
+// request headers — and a WebSocket handshake (a GET upgrade) has no
+// practical body channel. An Authorization header would therefore be
+// rejected by the panel. This fix only redacts the token from log output
+// (see RedactURL); it does not change how the token is transmitted.
 type WSClient struct {
 	wsURL    string // base WS URL, e.g. ws://panel.example.com:8076
 	token    string
@@ -210,7 +218,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 	}
 	u.RawQuery = q.Encode()
 
-	nlog.Core().Debug("ws connecting", "url", u.String())
+	// B7: u.String() carries the panel token in its query string, so it
+	// must never reach the logs verbatim (Debug output included).
+	nlog.Core().Debug("ws connecting", "url", RedactURL(u.String()))
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
@@ -393,9 +403,14 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
-			return
+		// An empty user list is a valid full sync, not an error: it means
+		// the panel currently has no available users for this node (e.g.
+		// every user ran out of quota). Dropping it here used to leave
+		// the last user of a node connected forever. Forward it so the
+		// service replaces the user set with the empty set and closes
+		// those users' connections.
+		if p.Users == nil {
+			p.Users = []User{}
 		}
 		event.Users = p.Users
 		event.NodeID = p.NodeID

@@ -49,19 +49,42 @@ type Tracker struct {
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
 
-	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
-	// Avoids allocating a new map+slice every 60s.
-	aliveIPsBuf map[int][]string
+	// restoredAliveIPs holds alive IPs saved by RestoreAliveIPs after a
+	// failed panel push. They are merged into the next FlushAliveIPs
+	// output even when the live snapshot hash is unchanged; without this
+	// separate store, restored data was merged into the flush buffer and
+	// then discarded by the next hash-equal flush, so it was never sent.
+	restoredAliveIPs map[int][]string
 
 	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
+
+	// intervalSeconds is the seconds between Process ticks (the
+	// track_interval config, default 10). InboundSpeed/OutboundSpeed
+	// divide per-cycle bytes by this value; the old code hardcoded /10,
+	// so any other track_interval made reported speeds wrong by the
+	// ratio interval/10.
+	intervalSeconds int64
 }
 
+// New creates a Tracker with the default 10s process interval.
 func New() *Tracker {
+	return NewWithInterval(10)
+}
+
+// NewWithInterval creates a Tracker whose speed calculation divides
+// per-cycle bytes by interval seconds. Non-positive values fall back
+// to 10s (the config default); config validation should also reject
+// them, this is defense in depth.
+func NewWithInterval(interval int) *Tracker {
+	if interval <= 0 {
+		interval = 10
+	}
 	t := &Tracker{
-		lastSeen:       make(map[int][2]int64),
-		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
+		lastSeen:         make(map[int][2]int64),
+		pendingTraffic:   make(map[int][2]int64),
+		restoredAliveIPs: make(map[int][]string),
+		intervalSeconds:  int64(interval),
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -159,8 +182,11 @@ func (t *Tracker) HasTraffic() bool {
 	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// FlushAliveIPs returns per-user alive IPs as a fresh copy (callers may
+// hold or mutate the result; it must never alias tracker state). It
+// returns nil only when the live snapshot is unchanged AND there is no
+// restored data pending; restored data from a failed push is merged in
+// even when the snapshot hash is unchanged, so it is actually re-sent.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
 	s := t.live.Load()
 
@@ -170,32 +196,43 @@ func (t *Tracker) FlushAliveIPs() map[int][]string {
 	// Calculate hash of current aliveIPs
 	currentHash := calcAliveIPsHash(s.aliveIPs)
 
-	// If no changes, return nil to avoid duplicate reporting
-	if currentHash == t.lastAliveIPsHash {
+	// If no changes and nothing restored, return nil to avoid duplicate
+	// reporting.
+	if currentHash == t.lastAliveIPsHash && len(t.restoredAliveIPs) == 0 {
 		return nil
 	}
 
 	t.lastAliveIPsHash = currentHash
 
-	// Clear old buffer entries.
-	for k := range t.aliveIPsBuf {
-		delete(t.aliveIPsBuf, k)
-	}
-
-	// Fill buffer from snapshot.
+	out := make(map[int][]string, len(s.aliveIPs)+len(t.restoredAliveIPs))
 	for uid, ips := range s.aliveIPs {
-		buf := t.aliveIPsBuf[uid]
-		if buf == nil {
-			buf = make([]string, 0, len(ips))
-		}
-		buf = buf[:0]
+		list := make([]string, 0, len(ips))
 		for ip := range ips {
-			buf = append(buf, ip)
+			list = append(list, ip)
 		}
-		t.aliveIPsBuf[uid] = buf
+		sort.Strings(list)
+		out[uid] = list
 	}
+	// Merge restored entries (deduped) and clear them: they are now part
+	// of this flush, and a failed flush will re-restore them via
+	// RestoreAliveIPs if the push fails again.
+	for uid, ipList := range t.restoredAliveIPs {
+		existing := out[uid]
+		seen := make(map[string]struct{}, len(existing)+len(ipList))
+		for _, ip := range existing {
+			seen[ip] = struct{}{}
+		}
+		for _, ip := range ipList {
+			if _, ok := seen[ip]; !ok {
+				existing = append(existing, ip)
+				seen[ip] = struct{}{}
+			}
+		}
+		out[uid] = existing
+	}
+	t.restoredAliveIPs = make(map[int][]string)
 
-	return t.aliveIPsBuf
+	return out
 }
 
 // calcAliveIPsHash computes a deterministic hash for change detection.
@@ -243,13 +280,19 @@ func (t *Tracker) CurrentOnline() map[int]int {
 	return cp
 }
 
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
+// RestoreAliveIPs saves alive IPs for re-sending after a failed panel
+// push. They are kept in a dedicated store (not the flush output), so the
+// next FlushAliveIPs merges them even when the live snapshot hash is
+// unchanged — previously they were merged into the flush buffer and then
+// silently dropped by the hash-equal fast path.
 func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.restoredAliveIPs == nil {
+		t.restoredAliveIPs = make(map[int][]string)
+	}
 	for uid, ipList := range data {
-		ips := t.aliveIPsBuf[uid]
+		ips := t.restoredAliveIPs[uid]
 		if ips == nil {
 			ips = make([]string, 0, len(ipList))
 		}
@@ -264,7 +307,7 @@ func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 				existMap[ip] = struct{}{}
 			}
 		}
-		t.aliveIPsBuf[uid] = ips
+		t.restoredAliveIPs[uid] = ips
 	}
 }
 
@@ -290,13 +333,21 @@ func (t *Tracker) TotalConnections() int64 {
 // InboundSpeed returns the last observed inbound (download) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) InboundSpeed() int64 {
-	return t.live.Load().inSpeed / 10
+	interval := t.intervalSeconds
+	if interval <= 0 {
+		interval = 10
+	}
+	return t.live.Load().inSpeed / interval
 }
 
 // OutboundSpeed returns the last observed outbound (upload) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
-	return t.live.Load().outSpeed / 10
+	interval := t.intervalSeconds
+	if interval <= 0 {
+		interval = 10
+	}
+	return t.live.Load().outSpeed / interval
 }
 
 // copyTrafficMap creates a shallow copy of the traffic map.

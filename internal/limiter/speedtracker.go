@@ -29,6 +29,26 @@ type SpeedTracker struct {
 	logFunc SpeedTrackerLogCallback
 }
 
+// burstFor computes the token-bucket burst for a bytes-per-second rate:
+// one second of traffic, floored at 64KiB, and capped at 4 seconds of
+// traffic. Both UpdateBuckets and GetLimiter must use it: they used to
+// compute burst inline, with GetLimiter carrying a 4s cap UpdateBuckets
+// lacked, so the effective burst depended on which path created the
+// limiter first (last caller wins). Note the cap is unreachable when
+// burst starts at bytesPerSec (bytesPerSec <= 4*bytesPerSec), so
+// unification preserves current behaviour while removing the
+// divergence risk for future edits.
+func burstFor(bytesPerSec int) int {
+	burst := bytesPerSec
+	if burst < 64*1024 {
+		burst = 64 * 1024
+	}
+	if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
+		burst = cap4s
+	}
+	return burst
+}
+
 // NewSpeedTracker creates a bucket manager for per-user bandwidth throttling.
 func NewSpeedTracker(l *Limiter) *SpeedTracker {
 	return &SpeedTracker{
@@ -69,12 +89,8 @@ func (t *SpeedTracker) UpdateBuckets() {
 			if lim, ok := t.buckets[user.ID]; ok {
 				if user.SpeedLimit > 0 {
 					bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
-					burst := bytesPerSec
-					if burst < 64*1024 {
-						burst = 64 * 1024
-					}
 					lim.SetLimit(rate.Limit(bytesPerSec))
-					lim.SetBurst(burst)
+					lim.SetBurst(burstFor(bytesPerSec))
 				} else {
 					delete(t.buckets, user.ID)
 				}
@@ -122,17 +138,9 @@ func (t *SpeedTracker) GetLimiter(user string) *rate.Limiter {
 		return nil
 	}
 
-	// Create limiter on-demand
+	// Create limiter on-demand (same burst rule as UpdateBuckets).
 	bytesPerSec := int(u.SpeedLimit) * 1_000_000 / 8
-	burst := bytesPerSec
-	if burst < 64*1024 {
-		burst = 64 * 1024
-	}
-	if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
-		burst = cap4s
-	}
-
-	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burstFor(bytesPerSec))
 
 	t.mu.Lock()
 	// Double-check after acquiring write lock

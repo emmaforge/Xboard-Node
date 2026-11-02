@@ -41,6 +41,14 @@ type Service struct {
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
 
+	// removedUserUUIDs remembers UUIDs of users removed from lastUsers, so
+	// trackAndEnforce can still kill their surviving connections (the
+	// kernel only knows a connection by UUID/email, and a removed user is
+	// no longer in lastUsers). Entries are pruned once the user has no
+	// alive IPs and no traffic left. Only touched from the main loop
+	// goroutine (applyUser*/trackAndEnforce), so no extra lock is needed.
+	removedUserUUIDs map[int]string
+
 	// nodeLog is the logger with node context for this service instance.
 	nodeLog *nlog.NodeLog
 
@@ -158,7 +166,10 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		source:       cp,
 		sink:         cp,
 		kernel:       k,
-		tracker:      tracker.New(),
+		// Speed calculation must divide by the actual track tick, not a
+		// hardcoded 10s (B4). NewWithInterval falls back to 10s when the
+		// config value is unset or invalid.
+		tracker:      tracker.NewWithInterval(cfg.Node.TrackInterval),
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,
@@ -765,6 +776,28 @@ func (s *Service) ensureRunning() bool {
 
 // ─── User update entry points ───────────────────────────────────────────────
 
+// closeRemovedUsers terminates the live connections of users that are no
+// longer in the user set, and records their UUIDs for the trackAndEnforce
+// safety net. Removing a user from the kernel only blocks NEW connections;
+// without this step, existing connections of a removed (e.g. out-of-quota)
+// user would keep running indefinitely.
+func (s *Service) closeRemovedUsers(ctx context.Context, removed []model.UserSpec) {
+	if len(removed) == 0 {
+		return
+	}
+	if s.removedUserUUIDs == nil {
+		s.removedUserUUIDs = make(map[int]string)
+	}
+	for _, u := range removed {
+		if u.UUID != "" {
+			s.removedUserUUIDs[u.ID] = u.UUID
+		}
+		if err := s.kernel.CloseUserConnections(ctx, u.UUID); err != nil {
+			nlog.Core().Warn(fmt.Sprintf("CloseUserConnections failed for user %d: %v", u.ID, err))
+		}
+	}
+}
+
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
@@ -773,14 +806,20 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 	}
 
 	prevUsers, prevHash := s.prepareUserState(users)
+	_, removedUsers := kernel.UserDiff(prevUsers, users)
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
 		if !s.startKernel(s.lastConfig, users) {
 			s.restoreUserState(prevUsers, prevHash)
+			return
 		}
+		// Kernel restarted with the new user set: the removed users are
+		// genuinely gone, so their connections must still be closed.
+		s.closeRemovedUsers(ctx, removedUsers)
 		return
 	}
+	s.closeRemovedUsers(ctx, removedUsers)
 	if newHash != "" {
 		s.lastUserHash = newHash
 	}
@@ -808,6 +847,9 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
 					s.kernel.RemoveUsers([]model.UserSpec{old})
+					// The old UUID's connections must die too, or the
+					// replaced user keeps using the old identity.
+					s.closeRemovedUsers(ctx, []model.UserSpec{old})
 					break
 				}
 			}
@@ -848,6 +890,10 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 				return
 			}
 		}
+		// RemoveUsers only blocks new connections; kill the removed
+		// users' existing connections, in both the direct and fallback
+		// paths (filtered is the authoritative new set in both).
+		s.closeRemovedUsers(ctx, deltaUsers)
 		if s.nodeLog != nil && removed > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
 		}
@@ -948,6 +994,50 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 	}
 
 	s.tracker.Process(traffic, aliveIPs, connCount)
+
+	// Safety net: if a connection still belongs to a user who is no longer
+	// in lastUsers (e.g. a removal event was lost, or a kernel failed to
+	// kill a connection on removal), kill it now. Without this, a removed
+	// user whose connection survived removal would keep using traffic
+	// forever. Users still in lastUsers are untouched.
+	if len(aliveIPs) > 0 {
+		s.metricsMu.RLock()
+		current := make(map[int]struct{}, len(s.lastUsers))
+		for _, u := range s.lastUsers {
+			current[u.ID] = struct{}{}
+		}
+		s.metricsMu.RUnlock()
+		for uid, ips := range aliveIPs {
+			if len(ips) == 0 {
+				continue
+			}
+			if _, ok := current[uid]; ok {
+				continue
+			}
+			uuid, ok := s.removedUserUUIDs[uid]
+			if !ok || uuid == "" {
+				// Unknown stray user (not removed through this service):
+				// we cannot resolve a UUID to close by, so log and skip
+				// rather than guessing.
+				nlog.Core().Debug(fmt.Sprintf("trackAndEnforce: stray connection for unknown removed user %d, cannot close without UUID", uid))
+				continue
+			}
+			if err := s.kernel.CloseUserConnections(ctx, uuid); err != nil {
+				nlog.Core().Warn(fmt.Sprintf("trackAndEnforce: CloseUserConnections failed for removed user %d: %v", uid, err))
+			}
+		}
+		// Prune tombstones for users with no alive IPs and no traffic left,
+		// so the map does not grow unboundedly with churned users.
+		for uid := range s.removedUserUUIDs {
+			if _, alive := aliveIPs[uid]; alive {
+				continue
+			}
+			if _, hasTraffic := traffic[uid]; hasTraffic {
+				continue
+			}
+			delete(s.removedUserUUIDs, uid)
+		}
+	}
 
 	// Only log stats if there's actual traffic or connections
 	if connCount > 0 || len(traffic) > 0 {

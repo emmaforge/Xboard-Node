@@ -107,3 +107,44 @@ func TestValidateCustomOutbounds(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateCustomOutbounds_DeepFields(t *testing.T) {
+	// Regression test for B16: settings used to pass through almost
+	// verbatim, so a missing server/uuid/password only failed later
+	// inside the kernel (or silently misbehaved).
+	validUUID := "550e8400-e29b-41d4-a716-446655440000"
+	cases := []struct {
+		name     string
+		outbound OutboundConfig
+		kernel   string
+		wantErr  string
+	}{
+		{"valid flat vmess", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"server": "example.com", "server_port": 443, "uuid": validUUID}}, "singbox", ""},
+		{"vmess missing uuid", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"server": "example.com", "server_port": 443}}, "singbox", "settings.uuid is required"},
+		{"vmess bad uuid", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"server": "example.com", "server_port": 443, "uuid": "not-a-uuid"}}, "singbox", "not a valid UUID"},
+		{"vmess missing port", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"server": "example.com", "uuid": validUUID}}, "singbox", "server_port is required"},
+		{"ss missing method", OutboundConfig{Tag: "s", Protocol: "shadowsocks", Settings: map[string]any{"server": "1.1.1.1", "server_port": 8388, "password": "pw"}}, "singbox", "settings.method is required"},
+		{"ss with cipher ok", OutboundConfig{Tag: "s", Protocol: "shadowsocks", Settings: map[string]any{"server": "1.1.1.1", "server_port": 8388, "cipher": "aes-256-gcm", "password": "pw"}}, "singbox", ""},
+		{"wireguard missing key", OutboundConfig{Tag: "w", Protocol: "wireguard", Settings: map[string]any{"server": "1.1.1.1", "server_port": 51820}}, "singbox", "private_key is required"},
+		{"bad server hostname", OutboundConfig{Tag: "s", Protocol: "socks", Settings: map[string]any{"server": "exa mple.com", "server_port": 1080}}, "singbox", "not a valid hostname"},
+		{"settings type reserved", OutboundConfig{Tag: "s", Protocol: "socks", Settings: map[string]any{"server": "1.1.1.1", "server_port": 1080, "type": "direct"}}, "singbox", "settings.type is reserved"},
+		{"native xray vmess still ok", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"vnext": []any{map[string]any{"address": "1.1.1.1", "port": 443}}}}, "xray", ""},
+		{"native shape rejected for singbox", OutboundConfig{Tag: "v", Protocol: "vmess", Settings: map[string]any{"vnext": []any{map[string]any{"address": "1.1.1.1", "port": 443}}}}, "singbox", "settings.server is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCustomOutboundsForKernel([]OutboundConfig{tc.outbound}, tc.kernel, nil)
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}

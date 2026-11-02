@@ -43,9 +43,13 @@ type Orchestrator struct {
 	mailboxes map[int]*controlplane.NodeMailbox
 	statuses  map[int]chan<- controlplane.StatusChange
 
-	// Shared WS client (nil when WS is disabled).
+	// Shared WS client (nil when WS is disabled or has never started).
 	ws       *panel.WSClient
 	wsCancel context.CancelFunc
+
+	// wsDisabled is set when the panel reports WS as disabled, so the
+	// Run loop does not keep retrying a handshake the panel refuses.
+	wsDisabled bool
 
 	// runCtx is stored from Run() so that onWSEvent can trigger rediscover
 	// for sync.nodes events without blocking the main loop.
@@ -97,6 +101,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	defer discoveryTicker.Stop()
 	defer statusTicker.Stop()
 
+	// B12: if the initial WS handshake failed, retry it on this ticker
+	// instead of staying REST-only forever. WSClient.Run reconnects on
+	// its own once started, so this only covers the never-started case.
+	wsRetryTicker := time.NewTicker(wsRetryInterval)
+	defer wsRetryTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,6 +118,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 		case <-statusTicker.C:
 			o.reportMachineStatus()
+
+		case <-wsRetryTicker.C:
+			if o.ws == nil && !o.wsDisabled {
+				o.tryStartWS(ctx)
+				if o.ws != nil || o.wsDisabled {
+					wsRetryTicker.Stop()
+				}
+			}
 		}
 	}
 }
@@ -269,14 +287,20 @@ func (o *Orchestrator) reportMachineStatus() {
 
 // ─── WS mux ─────────────────────────────────────────────────────────────
 
+// wsRetryInterval is how often the Run loop retries a failed initial
+// WS handshake. Short enough to recover promptly, long enough not to
+// hammer a panel that is briefly down.
+const wsRetryInterval = 30 * time.Second
+
 func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	hs, err := o.client.Handshake()
 	if err != nil {
-		nlog.Core().Warn("machine ws handshake failed, REST only", "error", err)
+		nlog.Core().Warn("machine ws handshake failed, will retry", "error", err)
 		return
 	}
 	if !hs.WebSocket.Enabled || hs.WebSocket.WSURL == "" {
 		nlog.Core().Info("machine: ws disabled by panel, REST only")
+		o.wsDisabled = true
 		return
 	}
 
@@ -364,14 +388,22 @@ func (o *Orchestrator) unregisterNode(nodeID int) {
 	o.eventsMu.Unlock()
 }
 
+// applyIntervals adopts the panel's base intervals, clamped UP to the
+// floors, not rewritten to 60s. Threshold semantics, confirmed from the
+// call sites: pullInterval drives node discovery (at most one panel poll
+// per 30s) and pushInterval drives machine status reports (at most one
+// per 10s) — both are rate protections, so a panel value below the floor
+// means "as fast as allowed", i.e. the floor itself. The old code
+// rewrote e.g. pull=20s to 60s, halving discovery freshness for no
+// reason, and did so silently.
 func (o *Orchestrator) applyIntervals(bc panel.MachineBaseConfig) {
 	o.pullInterval = time.Duration(bc.PullInterval) * time.Second
 	if o.pullInterval < 30*time.Second {
-		o.pullInterval = 60 * time.Second
+		o.pullInterval = 30 * time.Second
 	}
 	o.pushInterval = time.Duration(bc.PushInterval) * time.Second
 	if o.pushInterval < 10*time.Second {
-		o.pushInterval = 60 * time.Second
+		o.pushInterval = 10 * time.Second
 	}
 }
 

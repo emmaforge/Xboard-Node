@@ -230,3 +230,53 @@ func TestTrafficAccumulation(t *testing.T) {
 		t.Errorf("accumulated: got %v, want [350,600]", flushed[1])
 	}
 }
+
+func TestFlushAliveIPs_RestoredDataIsResentAfterFailedPush(t *testing.T) {
+	tr := New()
+	aliveIPs := map[int]map[string]bool{1: {"1.1.1.1": true}}
+	tr.Process(map[int][2]int64{1: {100, 200}}, aliveIPs, 1)
+
+	flushed := tr.FlushAliveIPs()
+	if len(flushed[1]) != 1 {
+		t.Fatalf("first flush: got %v, want 1 IP", flushed)
+	}
+	// Simulate a failed panel push: the caller restores the flushed data.
+	tr.RestoreAliveIPs(flushed)
+	// No new Process call, so the live snapshot hash is unchanged. The
+	// restored data must still be flushed again, not dropped.
+	resent := tr.FlushAliveIPs()
+	if resent == nil || len(resent[1]) != 1 || resent[1][0] != "1.1.1.1" {
+		t.Fatalf("resent flush: got %v, want [1.1.1.1]", resent)
+	}
+	// And a successful flush must not mutate tracker state via aliasing:
+	// mutating the returned map must not affect the next flush.
+	resent[1] = append(resent[1], "9.9.9.9")
+	if got := tr.FlushAliveIPs(); got != nil {
+		t.Fatalf("expected nil after successful flush, got %v", got)
+	}
+}
+
+func TestSpeedUsesTrackIntervalNotHardcoded10(t *testing.T) {
+	// Regression test for B4: with track_interval=5, 200 download bytes
+	// in one cycle must report 40 B/s, not 200/10=20 B/s.
+	tr := NewWithInterval(5)
+	tr.Process(map[int][2]int64{1: {100, 200}}, nil, 0)
+	if got := tr.InboundSpeed(); got != 40 {
+		t.Errorf("InboundSpeed with interval 5 = %d, want 40", got)
+	}
+	if got := tr.OutboundSpeed(); got != 20 {
+		t.Errorf("OutboundSpeed with interval 5 = %d, want 20", got)
+	}
+	// Default tracker keeps the old 10s behaviour.
+	def := New()
+	def.Process(map[int][2]int64{1: {100, 200}}, nil, 0)
+	if got := def.InboundSpeed(); got != 20 {
+		t.Errorf("InboundSpeed with default interval = %d, want 20", got)
+	}
+	// Non-positive interval falls back to 10s instead of dividing by zero.
+	bad := NewWithInterval(0)
+	bad.Process(map[int][2]int64{1: {100, 200}}, nil, 0)
+	if got := bad.InboundSpeed(); got != 20 {
+		t.Errorf("InboundSpeed with interval 0 fallback = %d, want 20", got)
+	}
+}

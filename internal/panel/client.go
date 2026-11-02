@@ -373,6 +373,16 @@ func (c *Client) injectAuth(m map[string]interface{}) {
 }
 
 // authQuery builds URL query parameters for GET requests.
+//
+// B7: the token stays in the query on purpose. The Xboard panel's
+// Server / ServerV2 middleware validates $request->input('token'), which
+// Laravel fills from the query string, form fields and JSON body — never
+// from request headers — and a GET request has no practical body channel.
+// Moving the token to an Authorization header would make the panel reject
+// the request, so this fix redacts the token from logs (see RedactURL)
+// instead of changing how it is transmitted. POST requests already send
+// the token as a JSON body field via injectAuth, which is the panel's
+// other accepted channel.
 func (c *Client) authQuery() url.Values {
 	q := url.Values{}
 	q.Set("token", c.token)

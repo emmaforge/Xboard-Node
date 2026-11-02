@@ -136,10 +136,24 @@ func (m *Manager) loadPersistedPEM() bool {
 
 // Reconfigure applies a new cert configuration at runtime (e.g. from panel push).
 // Returns true when the PEM material changed (caller should restart kernel).
+//
+// On failure it rolls back: the old config and the old PEM material are
+// restored, and if the old config ran ACME, the old ACME instance is
+// restarted best-effort so renewal resumes. Previously, a failed Start
+// left the manager in the new (broken) config with the old ACME instance
+// already torn down and no material at all, so the old certificate could
+// neither serve nor renew, and the node eventually dropped offline at
+// expiry. Note the old material is snapshotted BEFORE tear-down: the old
+// code read oldTLS after tearDownACME had already cleared it.
 func (m *Manager) Reconfigure(ctx context.Context, newCfg config.CertConfig) (bool, error) {
 	if newCfg.CertDir == "" {
 		newCfg.CertDir = m.cfg.CertDir
 	}
+
+	oldCfg := m.cfg
+	oldMat := m.mat.Load()
+	oldTLS := m.TLSCert()
+	wasACME := m.acmeStarted
 
 	// If ACME is running and the new config materially differs (or switches
 	// away from ACME), tear down the old certmagic instance first.
@@ -151,10 +165,19 @@ func (m *Manager) Reconfigure(ctx context.Context, newCfg config.CertConfig) (bo
 		}
 	}
 
-	oldTLS := m.TLSCert()
 	m.cfg = newCfg
 
 	if err := m.Start(ctx); err != nil {
+		// Restore the old state first, so serving continues with the old
+		// certificate even if the old ACME restart below also fails.
+		m.cfg = oldCfg
+		m.mat.Store(oldMat)
+		if wasACME {
+			if rerr := m.Start(ctx); rerr != nil {
+				nlog.Core().Warn("cert reconfigure failed and old ACME restart failed; serving old PEM until expiry",
+					"reconfigure_error", err, "restart_error", rerr)
+			}
+		}
 		return false, fmt.Errorf("cert reconfigure: %w", err)
 	}
 

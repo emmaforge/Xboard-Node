@@ -11,6 +11,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/tracker"
 	"golang.org/x/time/rate"
 )
 
@@ -25,6 +26,10 @@ type fakeKernel struct {
 	updateCalls int
 	addCalls    int
 	removeCalls int
+	closeCalls  int
+
+	closedUUIDs []string
+	trafficAlive map[int]map[string]bool
 
 	onUpdateUsers func([]model.UserSpec)
 	onAddUsers    func([]model.UserSpec)
@@ -81,7 +86,7 @@ func (f *fakeKernel) UpdateUsers(users []model.UserSpec) (int, int, error) {
 }
 func (f *fakeKernel) GetUserTraffic(ctx context.Context) (map[int][2]int64, map[int]map[string]bool, int, error) {
 	_ = ctx
-	return nil, nil, 0, nil
+	return nil, f.trafficAlive, len(f.trafficAlive), nil
 }
 func (f *fakeKernel) CloseConnection(ctx context.Context, connID string) error {
 	_, _ = ctx, connID
@@ -89,6 +94,8 @@ func (f *fakeKernel) CloseConnection(ctx context.Context, connID string) error {
 }
 func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) error {
 	_, _ = ctx, uuid
+	f.closeCalls++
+	f.closedUUIDs = append(f.closedUUIDs, uuid)
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
@@ -100,6 +107,7 @@ func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()
 	s := &Service{
 		kernel:       k,
+		tracker:      tracker.New(),
 		limiter:      sharedLimiter,
 		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
 		cert:         cert.NewManager(config.CertConfig{}),
@@ -294,5 +302,55 @@ func TestValidateNodeRuntimeRejectsRealityWithoutServerNameOrDest(t *testing.T) 
 	}
 	if got := err.Error(); got != "reality tls requires tls_settings.server_name or tls_settings.dest" {
 		t.Fatalf("unexpected error: %v", got)
+	}
+}
+
+func TestApplyUserUpdateClosesRemovedUsersConnections(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	oldUsers := []model.UserSpec{{ID: 1, UUID: "uuid-old", SpeedLimit: 4}, {ID: 2, UUID: "uuid-kept", SpeedLimit: 4}}
+	s.updateUserState(oldUsers)
+
+	newUsers := []model.UserSpec{{ID: 2, UUID: "uuid-kept", SpeedLimit: 4}}
+	s.applyUserUpdate(context.Background(), newUsers, computeUserHash(newUsers))
+
+	if k.closeCalls != 1 || len(k.closedUUIDs) != 1 || k.closedUUIDs[0] != "uuid-old" {
+		t.Fatalf("CloseUserConnections calls = %v, want [uuid-old]", k.closedUUIDs)
+	}
+}
+
+func TestApplyUserDeltaRemoveClosesRemovedUsersConnections(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	oldUsers := []model.UserSpec{{ID: 1, UUID: "uuid-old", SpeedLimit: 4}, {ID: 2, UUID: "uuid-kept", SpeedLimit: 4}}
+	s.updateUserState(oldUsers)
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1, UUID: "uuid-old"}})
+
+	if k.closeCalls != 1 || len(k.closedUUIDs) != 1 || k.closedUUIDs[0] != "uuid-old" {
+		t.Fatalf("CloseUserConnections calls = %v, want [uuid-old]", k.closedUUIDs)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 {
+		t.Fatalf("lastUsers = %#v, want only user 2", s.lastUsers)
+	}
+}
+
+func TestTrackAndEnforceClosesStrayRemovedUserConnections(t *testing.T) {
+	k := &fakeKernel{
+		running:      true,
+		trafficAlive: map[int]map[string]bool{1: {"1.1.1.1": true}, 2: {"2.2.2.2": true}},
+	}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	// User 2 is current; user 1 was removed earlier (tombstone recorded).
+	s.updateUserState([]model.UserSpec{{ID: 2, UUID: "uuid-kept", SpeedLimit: 4}})
+	s.removedUserUUIDs = map[int]string{1: "uuid-old"}
+
+	s.trackAndEnforce(context.Background())
+
+	if len(k.closedUUIDs) != 1 || k.closedUUIDs[0] != "uuid-old" {
+		t.Fatalf("CloseUserConnections calls = %v, want [uuid-old] only", k.closedUUIDs)
 	}
 }

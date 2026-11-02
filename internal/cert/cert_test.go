@@ -234,3 +234,67 @@ func TestACMEFingerprintEnvOrderStable(t *testing.T) {
 		t.Fatal("fingerprint not order-independent")
 	}
 }
+
+func TestReconfigureFailureRestoresOldConfigAndMaterial(t *testing.T) {
+	certPEM, keyPEM := generateSelfSignedPair(t, "example.test")
+	m := NewManager(config.CertConfig{
+		CertMode:    "content",
+		CertContent: string(certPEM),
+		KeyContent:  string(keyPEM),
+	})
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("initial Start: %v", err)
+	}
+	oldTLS := m.TLSCert()
+
+	// New config fails validation, so Start fails inside Reconfigure.
+	changed, err := m.Reconfigure(context.Background(), config.CertConfig{
+		CertMode:    "content",
+		CertContent: "not-a-certificate",
+		KeyContent:  "not-a-key",
+	})
+	if err == nil {
+		t.Fatal("expected Reconfigure to fail on invalid content")
+	}
+	if changed {
+		t.Error("expected changed=false on failed reconfigure")
+	}
+	if m.cfg.CertMode != "content" || m.cfg.CertContent != string(certPEM) {
+		t.Errorf("config was not rolled back: %+v", m.cfg)
+	}
+	got := m.TLSCert()
+	if string(got.CertPEM) != string(oldTLS.CertPEM) || string(got.KeyPEM) != string(oldTLS.KeyPEM) {
+		t.Error("old PEM material was not restored after failed reconfigure")
+	}
+}
+
+func TestReconfigureFailureRestartsOldACMEInstance(t *testing.T) {
+	certPEM, keyPEM := generateSelfSignedPair(t, "example.test")
+	m := NewManager(config.CertConfig{
+		CertMode:    "content",
+		CertContent: string(certPEM),
+		KeyContent:  string(keyPEM),
+	})
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("initial Start: %v", err)
+	}
+	// Simulate a previously running ACME instance: the tear-down path
+	// must run, and the rollback must restart the old config afterwards.
+	m.acmeStarted = true
+	m.acmeFingerprint = "old-fingerprint"
+
+	// DNS mode with no provider fails before any ACME work starts.
+	_, err := m.Reconfigure(context.Background(), config.CertConfig{
+		CertMode: "dns",
+		Domain:   "example.test",
+	})
+	if err == nil {
+		t.Fatal("expected Reconfigure to fail on missing DNS provider")
+	}
+	if m.cfg.CertMode != "content" {
+		t.Errorf("config was not rolled back, got mode %q", m.cfg.CertMode)
+	}
+	if !m.HasCert() {
+		t.Error("expected old certificate material to survive failed reconfigure")
+	}
+}

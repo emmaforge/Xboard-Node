@@ -145,3 +145,18 @@ func TestSpeedTracker_UpdateBuckets_LogCallbackMayCallLimitedUserCount(t *testin
 		t.Fatal("deadlock: UpdateBuckets did not finish (log callback vs RWMutex)")
 	}
 }
+
+func TestBurstForUnifiedAcrossPaths(t *testing.T) {
+	// Regression test for B10: burst must be computed identically by
+	// UpdateBuckets and GetLimiter, so a limiter's burst does not
+	// depend on which path created it first.
+	if got := burstFor(12_500_000); got != 12_500_000 {
+		t.Errorf("burstFor(12.5MB/s) = %d, want 12500000", got)
+	}
+	if got := burstFor(1000); got != 64*1024 {
+		t.Errorf("burstFor(1000) = %d, want 65536 floor", got)
+	}
+	if got := burstFor(20_000); got != 64*1024 {
+		t.Errorf("burstFor(20000) = %d, want 65536 floor", got)
+	}
+}

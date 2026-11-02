@@ -155,12 +155,12 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 		rules = append(rules, compileCustomRouteRule(rule)...)
 	}
 
-	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
-	for _, cr := range custom {
-		rules = append(rules, M(cr))
-	}
-
 	// Standard blocks for private IPv4 and IPv6 ranges to prevent SSRF.
+	// They must come BEFORE raw custom rules: sing-box matches the
+	// first rule, so a raw rule placed earlier could route private
+	// traffic to a proxy and bypass this block entirely (B16).
+	// Structured custom rules above are panel-managed and validated,
+	// so they intentionally keep their higher priority.
 	rules = append(rules,
 		M{
 			"outbound": "block",
@@ -185,6 +185,14 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 		},
 	)
 
+	// Raw custom routes remain the escape hatch, but no longer outrank
+	// the private-IP blocks (or structured rules). A raw rule for a
+	// public destination still works; only the private-range bypass
+	// is closed.
+	for _, cr := range custom {
+		rules = append(rules, M(cr))
+	}
+
 	for _, pr := range panelRoutes {
 		rules = append(rules, compilePanelRouteRule(pr)...)
 	}
@@ -200,10 +208,29 @@ func compilePanelRouteRule(pr model.RouteRule) []M {
 		return nil
 	}
 
-	var domains, cidrs []string
+	var domains, cidrs, geoips, geosites []string
 	for _, item := range pr.Match {
 		item = strings.TrimSpace(item)
 		if item == "" {
+			continue
+		}
+		// geoip:/geosite: entries must keep their own rule fields. They
+		// used to fall through to domain_suffix (e.g. "geoip:private"
+		// became domain_suffix "geoip:private", which never matches),
+		// silently breaking panel geo routing on the sing-box kernel.
+		// The xray counterpart (xray/config.go compilePanelRouteRule)
+		// already branches on these prefixes; mirror that here with
+		// sing-box's native geoip/geosite rule fields.
+		if v, ok := strings.CutPrefix(item, "geoip:"); ok {
+			if v != "" {
+				geoips = append(geoips, v)
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(item, "geosite:"); ok {
+			if v != "" {
+				geosites = append(geosites, v)
+			}
 			continue
 		}
 		item = strings.TrimPrefix(item, "*.")
@@ -240,6 +267,18 @@ func compilePanelRouteRule(pr model.RouteRule) []M {
 	if len(cidrs) > 0 {
 		compiled = append(compiled, M{
 			"ip_cidr":  copyStrings(cidrs),
+			"outbound": outbound,
+		})
+	}
+	if len(geoips) > 0 {
+		compiled = append(compiled, M{
+			"geoip":    copyStrings(geoips),
+			"outbound": outbound,
+		})
+	}
+	if len(geosites) > 0 {
+		compiled = append(compiled, M{
+			"geosite":  copyStrings(geosites),
 			"outbound": outbound,
 		})
 	}
@@ -351,6 +390,54 @@ func copyStrings(src []string) []string {
 	return out
 }
 
+// privateBlockCIDRs is the exact set of CIDRs used by the generated
+// private-IP blocks in buildRoutes. A rule counts as a private block
+// only when its outbound is "block" and every ip_cidr entry is in
+// this set.
+var privateBlockCIDRs = map[string]struct{}{
+	"10.0.0.0/8": {}, "100.64.0.0/10": {}, "127.0.0.0/8": {},
+	"169.254.0.0/16": {}, "172.16.0.0/12": {}, "192.0.0.0/24": {},
+	"192.168.0.0/16": {}, "198.18.0.0/15": {},
+	"fc00::/7": {}, "fe80::/10": {}, "::1/128": {},
+}
+
+func isPrivateBlockRule(rule M) bool {
+	if rule["outbound"] != "block" {
+		return false
+	}
+	cidrs, ok := rule["ip_cidr"].([]string)
+	if !ok || len(cidrs) == 0 {
+		return false
+	}
+	for _, c := range cidrs {
+		if _, ok := privateBlockCIDRs[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// insertAfterPrivateBlocks splices custom rules right after the last
+// private-IP block in existing, preserving their priority over panel
+// rules. With no private blocks present it prepends, as before.
+func insertAfterPrivateBlocks(existing []M, customRaw any) []M {
+	custom := kernel.MergeAppendList(nil, customRaw)
+	if len(custom) == 0 {
+		return existing
+	}
+	insertAt := 0
+	for i, rule := range existing {
+		if isPrivateBlockRule(rule) {
+			insertAt = i + 1
+		}
+	}
+	out := make([]M, 0, len(existing)+len(custom))
+	out = append(out, existing[:insertAt]...)
+	out = append(out, custom...)
+	out = append(out, existing[insertAt:]...)
+	return out
+}
+
 func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
 	custom, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
 	if err != nil {
@@ -404,10 +491,14 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 		cfg["route"] = route
 	}
 
-	// rules — custom rules prepended (so they match before panel rules)
+	// rules — custom rules inserted after the private-IP blocks but
+	// before panel rules (B16). Prepending them before everything used
+	// to let a raw file rule route private traffic to a proxy and
+	// bypass the SSRF blocks entirely. If no private blocks are
+	// present, this falls back to the old prepend behaviour.
 	if v, ok := customRoute["rules"]; ok {
 		if existing, ok := route["rules"].([]M); ok {
-			route["rules"] = kernel.MergePrependList(existing, v)
+			route["rules"] = insertAfterPrivateBlocks(existing, v)
 		}
 	}
 

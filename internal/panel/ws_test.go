@@ -1,15 +1,19 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/gorilla/websocket"
 )
 
@@ -287,5 +291,135 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 	}
 	if len(received[0].DeltaUsers) != 1 || received[0].DeltaUsers[0].ID != 42 {
 		t.Errorf("unexpected DeltaUsers: %+v", received[0].DeltaUsers)
+	}
+}
+
+func TestWSClient_EmptyUsersListIsForwardedNotDropped(t *testing.T) {
+	// Two variants of "no users": an explicit empty list and a payload
+	// with the users field missing entirely. Both must reach the callback
+	// as a non-nil empty list, so the service can replace the user set
+	// with the empty set (and close those users' connections) instead of
+	// silently keeping the old users forever.
+	emptyData, _ := json.Marshal(syncUsersPayload{Users: []User{}, Timestamp: 1234})
+	missingData, _ := json.Marshal(syncUsersPayload{Timestamp: 1235})
+
+	events := []wsMessage{
+		{Event: WSEventSyncUsers, Data: emptyData},
+		{Event: WSEventSyncUsers, Data: missingData},
+	}
+	server := fakeWSServer(t, events)
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	var mu sync.Mutex
+	var received []WSEvent
+	ws := NewWSClient("ws://"+host, "test-token", 1, WSClientConfig{}, func(event WSEvent) {
+		mu.Lock()
+		received = append(received, event)
+		mu.Unlock()
+	}, nil, func() map[string]interface{} { return nil })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go ws.Run(ctx)
+
+	deadline := time.After(1500 * time.Millisecond)
+	for {
+		mu.Lock()
+		n := len(received)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for events, got %d", n)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, ev := range received {
+		if ev.Type != WSEventSyncUsers {
+			t.Errorf("event[%d].Type = %q, want %q", i, ev.Type, WSEventSyncUsers)
+		}
+		if ev.Users == nil {
+			t.Errorf("event[%d].Users is nil, want non-nil empty list", i)
+		}
+		if len(ev.Users) != 0 {
+			t.Errorf("event[%d].Users = %v, want empty", i, ev.Users)
+		}
+	}
+}
+
+// TestWSConnectLogRedactsToken (B7) proves the "ws connecting" Debug line
+// never carries the real panel token, while still showing that a
+// connection was attempted (with the token masked).
+func TestWSConnectLogRedactsToken(t *testing.T) {
+	const secret = "b7-secret-token-xyz"
+
+	var buf bytes.Buffer
+	nlog.Init(&buf, slog.LevelDebug, false)
+	defer nlog.Init(os.Stdout, slog.LevelInfo, false)
+
+	// Server: verify the real token still arrives over the wire (the
+	// transport is unchanged), send auth.success, then wait for the
+	// client to close.
+	sawRequest := make(chan struct{}, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("token") != secret {
+			http.Error(w, "missing auth params", http.StatusUnauthorized)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteJSON(wsMessage{Event: "auth.success"})
+		select {
+		case sawRequest <- struct{}{}:
+		default:
+		}
+		// Block until the client closes the connection.
+		for {
+			var msg wsMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	ws := NewWSClient("ws://"+host, secret, 1, WSClientConfig{}, nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ws.connect(ctx) }()
+
+	select {
+	case <-sawRequest:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for the server to see the WS handshake")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for connect() to return after cancel")
+	}
+
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Errorf("connect log contains the real token:\n%s", out)
+	}
+	if !strings.Contains(out, "ws connecting") {
+		t.Errorf("expected a 'ws connecting' log line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "token=REDACTED") {
+		t.Errorf("expected the masked token in the log line, got:\n%s", out)
 	}
 }
