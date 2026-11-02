@@ -171,6 +171,30 @@ func TestFormatServiceStatus(t *testing.T) {
 	}
 }
 
+func TestColorizeStatusValue(t *testing.T) {
+	cases := map[string]string{
+		"已运行": "\x1b[32m已运行\x1b[0m",
+		"未运行": "\x1b[31m未运行\x1b[0m",
+		"异常":  "\x1b[31m异常\x1b[0m",
+		"启动中": "\x1b[33m启动中\x1b[0m",
+		"未知":  "未知",
+	}
+	for in, want := range cases {
+		if got := colorizeStatusValue(in, true); got != want {
+			t.Errorf("colorizeStatusValue(%q, true) = %q, want %q", in, got, want)
+		}
+		if got := colorizeStatusValue(in, false); got != in {
+			t.Errorf("colorizeStatusValue(%q, false) = %q, want plain %q", in, got, in)
+		}
+	}
+	if got := colorizeAutostartValue("是", true); got != "\x1b[32m是\x1b[0m" {
+		t.Errorf("colorizeAutostartValue(是) = %q", got)
+	}
+	if got := colorizeAutostartValue("否", true); got != "\x1b[31m否\x1b[0m" {
+		t.Errorf("colorizeAutostartValue(否) = %q", got)
+	}
+}
+
 func TestPrintMenuShowsServiceStatus(t *testing.T) {
 	var out bytes.Buffer
 	printMenu(&out)

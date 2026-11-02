@@ -98,8 +98,9 @@ func printMenu(out io.Writer) {
 	}
 	fmt.Fprintln(out, "=============================================================")
 	status, autostart := serviceStatusLine()
-	fmt.Fprintf(out, "xboard-node 状态：%s\n", status)
-	fmt.Fprintf(out, "是否开机自启：%s\n", autostart)
+	color := menuOutputIsTerminal(out)
+	fmt.Fprintf(out, "xboard-node 状态：%s\n", colorizeStatusValue(status, color))
+	fmt.Fprintf(out, "是否开机自启：%s\n", colorizeAutostartValue(autostart, color))
 	fmt.Fprint(out, "请输入选项编号 [0-12]：")
 }
 
@@ -153,6 +154,46 @@ func formatServiceStatus(state string) string {
 	default:
 		return "未运行"
 	}
+}
+
+// menuOutputIsTerminal 判断菜单输出是否写到终端：只有真终端才上色，
+// 重定向到文件或测试里的 buffer 不带转义码，免得污染输出和对齐计算。
+func menuOutputIsTerminal(out io.Writer) bool {
+	f, ok := out.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// colorizeStatusValue 给运行状态值上色：开（已运行）绿，关（未运行、
+// 异常）红，启动/停止中黄，未知不着色。color 为 false 时原样返回。
+func colorizeStatusValue(status string, color bool) string {
+	if !color {
+		return status
+	}
+	switch status {
+	case "已运行":
+		return "\x1b[32m" + status + "\x1b[0m"
+	case "未运行", "异常":
+		return "\x1b[31m" + status + "\x1b[0m"
+	case "启动中", "停止中":
+		return "\x1b[33m" + status + "\x1b[0m"
+	default:
+		return status
+	}
+}
+
+// colorizeAutostartValue 给开机自启值上色：是绿，否红。
+func colorizeAutostartValue(autostart string, color bool) string {
+	if !color {
+		return autostart
+	}
+	if autostart == "是" {
+		return "\x1b[32m是\x1b[0m"
+	}
+	return "\x1b[31m否\x1b[0m"
 }
 
 // serviceStatusLine 查询服务的运行状态与开机自启状态，供菜单底部展示。
