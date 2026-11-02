@@ -27,7 +27,7 @@ DEFAULT_ACTION="install"
 DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
-DEFAULT_DOWNLOAD_BASE="https://github.com/zzx327317-creator/Xboard-Node/releases"
+DEFAULT_DOWNLOAD_BASE="https://github.com/emmaforge/Xboard-Node/releases"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -757,7 +757,7 @@ render_service() {
     cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
-Documentation=https://github.com/zzx327317-creator/Xboard-Node
+Documentation=https://github.com/emmaforge/Xboard-Node
 After=network-online.target
 Wants=network-online.target
 

@@ -20,16 +20,16 @@
 
 ```bash
 # 先装后配（推荐，像 V2bX 一样）：不带绑定参数直接安装，装完用交互菜单绑定
-curl -fsSL https://raw.githubusercontent.com/zzx327317-creator/Xboard-Node/dev/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/emmaforge/Xboard-Node/dev/install.sh | sudo bash
 xbnode
 # 在中文交互菜单里选 1 绑定节点或选 2 绑定机器，按提示填写面板地址、密钥和节点/机器 ID
 
 # 安装时直接绑定（备选）：节点模式
-curl -fsSL https://raw.githubusercontent.com/zzx327317-creator/Xboard-Node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/emmaforge/Xboard-Node/dev/install.sh | \
   sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1
 
 # 安装时直接绑定（备选）：机器模式
-curl -fsSL https://raw.githubusercontent.com/zzx327317-creator/Xboard-Node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/emmaforge/Xboard-Node/dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
 ```
 
