@@ -20,7 +20,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.7'
+          go-version: '1.26'
           cache: true
 
       - name: Run tests
@@ -43,7 +43,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.7'
+          go-version: '1.26'
           cache: true
 
       - name: Build
@@ -98,9 +98,9 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/cedar2025/xboard-node:latest
-            ghcr.io/cedar2025/xboard-node:${{ github.sha }}
-            ${{ startsWith(github.ref, 'refs/tags/') && format('ghcr.io/cedar2025/xboard-node:{0}', github.ref_name) || '' }}
+            ghcr.io/zzx327317-creator/xboard-node:latest
+            ghcr.io/zzx327317-creator/xboard-node:${{ github.sha }}
+            ${{ startsWith(github.ref, 'refs/tags/') && format('ghcr.io/zzx327317-creator/xboard-node:{0}', github.ref_name) || '' }}
 
   release:
     name: Release
@@ -116,6 +116,17 @@ jobs:
         with:
           merge-multiple: true
           path: dist
+      # Publish SHA-256 sidecars next to every binary so install.sh and
+      # xbctl upgrade can verify downloads instead of trusting the
+      # version self-check alone. The sidecar format is the standard
+      # "<hash>  <filename>" output of sha256sum, which both verifiers
+      # parse by taking the first field.
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          for f in xboard-node-linux-amd64 xboard-node-linux-arm64 xbctl-linux-amd64 xbctl-linux-arm64; do
+            sha256sum "$f" > "$f.sha256"
+          done
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -123,6 +134,10 @@ jobs:
           make_latest: ${{ startsWith(github.ref, 'refs/tags/') }}
           files: |
             dist/xboard-node-linux-amd64
+            dist/xboard-node-linux-amd64.sha256
             dist/xboard-node-linux-arm64
+            dist/xboard-node-linux-arm64.sha256
             dist/xbctl-linux-amd64
+            dist/xbctl-linux-amd64.sha256
             dist/xbctl-linux-arm64
+            dist/xbctl-linux-arm64.sha256
