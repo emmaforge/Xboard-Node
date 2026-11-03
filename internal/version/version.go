@@ -8,4 +8,4 @@
 package version
 
 // Version is the current release version.
-const Version = "v1.0.1"
+const Version = "v1.0.2"

@@ -198,9 +198,10 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 
 	perNodeClient := o.client.ForNode(mn.ID)
 
-	// Pre-fetch node config to detect transport-based kernel requirements.
-	// If the transport (e.g. xhttp) is incompatible with the configured kernel
-	// (e.g. singbox), auto-switch to the required kernel for this node.
+	// Pre-fetch node config to detect kernel requirements.
+	// If the transport (e.g. xhttp) or an enabled feature (e.g. VLESS
+	// Encryption) is incompatible with the configured kernel (e.g. singbox),
+	// auto-switch to the required kernel for this node.
 	// A prefetch failure used to be swallowed silently (empty err branch),
 	// so a node could start on the wrong kernel with no trace. Now it is
 	// logged, and the kernel choice is re-checked by the service's
@@ -212,9 +213,9 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	} else if cfgSnapshot == nil {
 		nlog.Core().Warn("machine: prefetch node config returned empty snapshot, kernel auto-switch skipped",
 			"node_id", mn.ID)
-	} else if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
-		nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
-			mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
+	} else if resolved, reason := model.ResolveKernelForNode(cfgSnapshot.Network, cfgSnapshot.Decryption, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
+		nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, reason=%s, transport=%s)",
+			mn.ID, nodeCfg.Kernel.Type, resolved, reason, cfgSnapshot.Network))
 		nodeCfg.Kernel.Type = resolved
 	}
 	// Reset cached ETag so the subsequent GetConfig in Initial() gets a full response.

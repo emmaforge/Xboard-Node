@@ -56,16 +56,36 @@ func validateTransportKernel(network, kernelType string) error {
 	return nil
 }
 
+// ResolveKernelForNode returns the kernel type required by the given node
+// config. If the configured kernel cannot handle the node, it returns the
+// kernel that can, plus a short reason ("transport" or "encryption").
+// Otherwise it returns configuredKernel unchanged with an empty reason.
+// This is used in machine mode to auto-switch kernel per node.
+func ResolveKernelForNode(network, decryption, configuredKernel string) (string, string) {
+	if configuredKernel != "singbox" {
+		return configuredKernel, ""
+	}
+	net := strings.ToLower(strings.TrimSpace(network))
+	if singboxUnsupportedTransports[net] {
+		return "xray", "transport"
+	}
+	// Same condition the sing-box VLESS builder uses when it warns and
+	// drops the decryption setting: an enabled VLESS Encryption needs xray.
+	if decryption != "" && decryption != "none" {
+		return "xray", "encryption"
+	}
+	return configuredKernel, ""
+}
+
 // ResolveKernelForTransport returns the kernel type required by the given
 // transport. If the configured kernel cannot handle the transport, it returns
 // the kernel that can. Otherwise it returns configuredKernel unchanged.
 // This is used in machine mode to auto-switch kernel per node.
+// (Transport-only wrapper around ResolveKernelForNode; VLESS Encryption is
+// not considered here.)
 func ResolveKernelForTransport(network, configuredKernel string) string {
-	net := strings.ToLower(strings.TrimSpace(network))
-	if configuredKernel == "singbox" && singboxUnsupportedTransports[net] {
-		return "xray"
-	}
-	return configuredKernel
+	resolved, _ := ResolveKernelForNode(network, "", configuredKernel)
+	return resolved
 }
 
 func normalizeKernelType(value string) (string, error) {
